@@ -315,6 +315,174 @@ def distillation_loss(student_logits, teacher_logits, targets,
 
 
 # ==============================================================================
+#  WHITE-BOX KNOWLEDGE DISTILLATION — Hidden State Matching
+#  Papers: ICLR 2025 (CKA), DistilQwen2.5 (Apr 2025)
+# ==============================================================================
+
+def compute_cka(X, Y):
+    """Centered Kernel Alignment (CKA) — ICLR 2025.
+
+    Measures similarity between two sets of representations regardless of
+    dimensionality. This is the key innovation: student and teacher can have
+    different hidden dimensions.
+
+    CKA(X, Y) = ||Y^T X||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
+
+    Args:
+        X: (N, d1) student hidden states
+        Y: (N, d2) teacher hidden states
+    Returns:
+        CKA similarity in [0, 1]
+    """
+    # Center the representations
+    X = X - X.mean(dim=0, keepdim=True)
+    Y = Y - Y.mean(dim=0, keepdim=True)
+
+    # Linear CKA
+    XtX = X.T @ X  # (d1, d1)
+    YtY = Y.T @ Y  # (d2, d2)
+    YtX = Y.T @ X  # (d2, d1)
+
+    numerator = (YtX * YtX).sum()
+    denominator = torch.sqrt((XtX * XtX).sum() * (YtY * YtY).sum())
+
+    return numerator / (denominator + 1e-8)
+
+
+def hidden_state_loss(student_hidden, teacher_hidden, method="cka",
+                      projector=None):
+    """Compute hidden state matching loss between teacher and student layers.
+
+    Supports:
+    - CKA: Centered Kernel Alignment (works with different dims)
+    - MSE: Mean Squared Error (needs same dims or projector)
+    - cosine: Cosine similarity loss
+
+    Args:
+        student_hidden: (B, T, d_student) student layer output
+        teacher_hidden: (B, T, d_teacher) teacher layer output
+        method: "cka", "mse", or "cosine"
+        projector: optional nn.Linear to project student to teacher dim
+
+    Returns:
+        loss: scalar loss (lower = more similar)
+    """
+    B, T, d_s = student_hidden.shape
+    _, _, d_t = teacher_hidden.shape
+
+    # Flatten batch and time: (B*T, d)
+    s_flat = student_hidden.reshape(-1, d_s)
+    t_flat = teacher_hidden.reshape(-1, d_t).detach()
+
+    if method == "cka":
+        # CKA: works with different dimensions (key ICLR 2025 insight)
+        cka_score = compute_cka(s_flat, t_flat)
+        return 1.0 - cka_score  # We want to maximize CKA
+
+    elif method == "mse":
+        # MSE: project student to teacher dim if needed
+        if d_s != d_t:
+            if projector is not None:
+                s_flat = projector(s_flat)
+            else:
+                # Simple linear interpolation
+                s_flat = F.interpolate(
+                    s_flat.unsqueeze(0), size=d_t, mode='linear'
+                ).squeeze(0)
+        return F.mse_loss(s_flat, t_flat)
+
+    elif method == "cosine":
+        # Cosine: dimension-agnostic via pooling
+        if d_s != d_t:
+            min_d = min(d_s, d_t)
+            s_flat = s_flat[:, :min_d]
+            t_flat = t_flat[:, :min_d]
+        cos_sim = F.cosine_similarity(s_flat, t_flat, dim=-1)
+        return 1.0 - cos_sim.mean()
+
+    else:
+        raise ValueError(f"Unknown hidden loss method: {method}")
+
+
+def get_layer_mapping(n_student_layers, n_teacher_layers):
+    """Map student layers to teacher layers (forward mapping).
+
+    Paper insight: vanilla forward mapping works as well as complex strategies.
+    Maps student layer i to teacher layer floor(i * n_teacher / n_student).
+    """
+    mapping = {}
+    for i in range(n_student_layers):
+        j = int(i * n_teacher_layers / n_student_layers)
+        mapping[i] = min(j, n_teacher_layers - 1)
+    return mapping
+
+
+# ==============================================================================
+#  MIX DISTILLATION — Multi-Teacher + Curriculum
+#  Paper: "Small Models Struggle to Learn from Strong Reasoners" (Nov 2025)
+# ==============================================================================
+
+def mix_teacher_logits(logits_large, logits_small, alpha_schedule, step,
+                       max_steps):
+    """Blend logits from a large and small teacher.
+
+    Key insight from Nov 2025 paper: small students learn better from a
+    MIX of large + small teacher outputs than from large teacher alone.
+
+    Annealing schedule: start with more weight on smaller teacher (easier),
+    gradually shift to larger teacher (harder).
+
+    Args:
+        logits_large: (B, T, V) logits from large teacher
+        logits_small: (B, T, V) logits from small teacher
+        alpha_schedule: "linear" or "cosine"
+        step: current training step
+        max_steps: total training steps
+
+    Returns:
+        mixed_logits: (B, T, V) blended teacher logits
+    """
+    progress = step / max(max_steps, 1)
+
+    if alpha_schedule == "linear":
+        # Start at 0.3 (mostly small teacher), end at 0.8 (mostly large)
+        w_large = 0.3 + 0.5 * progress
+    elif alpha_schedule == "cosine":
+        w_large = 0.3 + 0.5 * (1 - math.cos(math.pi * progress)) / 2
+    else:
+        w_large = 0.5  # Fixed 50/50
+
+    # Handle vocab size mismatch
+    v_min = min(logits_large.size(-1), logits_small.size(-1))
+    mixed = w_large * logits_large[..., :v_min] + (1 - w_large) * logits_small[..., :v_min]
+
+    # If large teacher has extra vocab, append those logits
+    if logits_large.size(-1) > v_min:
+        mixed = torch.cat([mixed, logits_large[..., v_min:] * w_large], dim=-1)
+
+    return mixed
+
+
+def curriculum_difficulty(data_losses, step, max_steps, warmup_frac=0.2):
+    """Curriculum learning: select easier samples early, harder later.
+
+    Args:
+        data_losses: pre-computed per-sample losses
+        step: current step
+        max_steps: total steps
+        warmup_frac: fraction of training for full curriculum (rest = random)
+
+    Returns:
+        selection_mask: which samples to use
+    """
+    progress = min(step / (max_steps * warmup_frac), 1.0)
+    # Start with easiest 30%, expand to 100%
+    percentile = 0.3 + 0.7 * progress
+    threshold = torch.quantile(data_losses, percentile)
+    return data_losses <= threshold
+
+
+# ==============================================================================
 #  Evaluation
 # ==============================================================================
 
@@ -589,6 +757,22 @@ Examples:
                         help="Distillation temperature (default: 2.0, higher=softer)")
     parser.add_argument("--alpha", type=float, default=0.5,
                         help="KD vs CE balance: 1.0=pure KD, 0.0=pure CE (default: 0.5)")
+
+    # White-Box KD (ICLR 2025 — CKA hidden state matching)
+    parser.add_argument("--hidden-loss", type=str, default="none",
+                        choices=["none", "cka", "mse", "cosine"],
+                        help="Hidden state matching method (default: none)")
+    parser.add_argument("--hidden-weight", type=float, default=0.1,
+                        help="Weight for hidden state loss (default: 0.1)")
+
+    # Mix Distillation (Nov 2025 — multi-teacher + curriculum)
+    parser.add_argument("--hf-teacher-small", type=str, default=None,
+                        help="Second (smaller) HuggingFace teacher for Mix Distillation")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Enable curriculum learning (easy→hard)")
+    parser.add_argument("--mix-schedule", type=str, default="cosine",
+                        choices=["linear", "cosine", "fixed"],
+                        help="Annealing schedule for multi-teacher blending")
 
     # Training
     parser.add_argument("--data", type=str, default="data",

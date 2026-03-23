@@ -64,6 +64,12 @@ class GPTConfig:
     lora_alpha: float = 16.0     # LoRA scaling factor
     lora_dropout: float = 0.0    # Dropout on LoRA layers
 
+    # ── Native Sparse Attention (NSA) — DeepSeek, Feb 2025 ───────────
+    use_nsa: bool = False        # Use NSA instead of standard attention
+    nsa_block_size: int = 32     # Compression block size
+    nsa_top_k: int = 16          # Top-k token selection per query
+    nsa_window_size: int = 256   # Sliding window size
+
     def to_dict(self):
         return dataclasses.asdict(self)
 

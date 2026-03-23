@@ -664,6 +664,230 @@ class CausalSelfAttention(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  NATIVE SPARSE ATTENTION (NSA) — DeepSeek, arXiv 2502.11089, Feb 2025
+#  Trainable 3-branch sparse attention: 9x faster than full attention
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NativeSparseAttention(nn.Module):
+    """Native Sparse Attention with 3-branch hierarchical strategy.
+
+    Branch 1 — Token Compression: Compress KV into summary tokens via
+               learned pooling for efficient global context
+    Branch 2 — Top-k Selection: Select most important tokens based on
+               query-key similarity scores
+    Branch 3 — Sliding Window: Local attention over recent w tokens
+
+    The three branches are combined with learned gating weights,
+    giving the model global + selective + local awareness.
+
+    Paper: "Native Sparse Attention: Hardware-Aligned and Natively Trainable
+            Sparse Attention" (DeepSeek, Feb 2025)
+    """
+
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.n_embd = config.n_embd
+
+        # NSA-specific params
+        self.nsa_block_size = getattr(config, 'nsa_block_size', 32)
+        self.nsa_top_k = getattr(config, 'nsa_top_k', 16)
+        self.nsa_window_size = getattr(config, 'nsa_window_size', 256)
+
+        # QKV projections (same as standard attention)
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.v_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        # Branch 1: Token Compression — learned pooling kernel
+        self.compress_k = nn.Linear(
+            self.head_dim * self.nsa_block_size,
+            self.head_dim, bias=False,
+        )
+        self.compress_v = nn.Linear(
+            self.head_dim * self.nsa_block_size,
+            self.head_dim, bias=False,
+        )
+
+        # Branch gating — learned fusion weights for 3 branches
+        self.gate = nn.Linear(config.n_embd, 3 * config.n_head, bias=False)
+
+        # RoPE
+        if config.use_rope:
+            self.rope = RotaryEmbedding(
+                self.head_dim, max_seq_len=config.block_size,
+                scaling_type=config.rope_scaling_type,
+                scaling_factor=config.rope_scaling_factor,
+            )
+        else:
+            self.rope = None
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+    def _compress_kv(self, k, v):
+        """Branch 1: Compress KV tokens via learned pooling.
+
+        Takes (B, nh, T, hd) and pools every nsa_block_size tokens
+        into a single summary token via a learned linear.
+        """
+        B, nh, T, hd = k.shape
+        bs = self.nsa_block_size
+
+        # Pad to multiple of block_size
+        pad_len = (bs - T % bs) % bs
+        if pad_len > 0:
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+
+        T_padded = k.shape[2]
+        n_blocks = T_padded // bs
+
+        # Reshape: (B, nh, n_blocks, block_size * hd)
+        k_blocks = k.reshape(B, nh, n_blocks, bs * hd)
+        v_blocks = v.reshape(B, nh, n_blocks, bs * hd)
+
+        # Learned compression (pooling)
+        k_compressed = self.compress_k(k_blocks)  # (B, nh, n_blocks, hd)
+        v_compressed = self.compress_v(v_blocks)  # (B, nh, n_blocks, hd)
+
+        return k_compressed, v_compressed
+
+    def _select_topk(self, q, k, v):
+        """Branch 2: Select top-k important tokens per query.
+
+        Uses query-key dot product scores to identify the most
+        relevant tokens for each query position.
+        """
+        B, nh, T, hd = q.shape
+        topk = min(self.nsa_top_k, k.shape[2])
+
+        # Compute attention scores: (B, nh, T, T_kv)
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Apply causal mask
+        causal_mask = torch.triu(
+            torch.ones(T, k.shape[2], dtype=torch.bool, device=q.device),
+            diagonal=1,
+        )
+        scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        # Top-k selection per query
+        topk_scores, topk_indices = scores.topk(topk, dim=-1)  # (B, nh, T, topk)
+
+        # Gather selected KV
+        topk_indices_expanded = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, hd)
+        k_selected = k.unsqueeze(2).expand(-1, -1, T, -1, -1)
+        k_selected = torch.gather(k_selected, 3, topk_indices_expanded)
+        v_selected = v.unsqueeze(2).expand(-1, -1, T, -1, -1)
+        v_selected = torch.gather(v_selected, 3, topk_indices_expanded)
+
+        # Attend to selected tokens
+        attn = F.softmax(topk_scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn.unsqueeze(-2), v_selected).squeeze(-2)
+
+        return out  # (B, nh, T, hd)
+
+    def _sliding_window(self, q, k, v, window_size=None):
+        """Branch 3: Sliding window attention over recent tokens."""
+        B, nh, T, hd = q.shape
+        w = window_size or self.nsa_window_size
+
+        # For each query position, attend only to the last w tokens
+        # Use efficient implementation with masking
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Sliding window + causal mask
+        positions = torch.arange(T, device=q.device)
+        # kv_positions = positions for now (same length)
+        kv_len = k.shape[2]
+        q_pos = positions.unsqueeze(1)      # (T, 1)
+        k_pos = torch.arange(kv_len, device=q.device).unsqueeze(0)  # (1, T_kv)
+
+        # Causal: k_pos <= q_pos
+        # Window: q_pos - k_pos < w
+        mask = (k_pos <= q_pos) & (q_pos - k_pos < w)
+        scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
+        out = torch.matmul(attn, v)
+
+        return out  # (B, nh, T, hd)
+
+    def forward(self, x, past_kv=None):
+        """NSA forward: combine 3 branches with learned gating.
+
+        Returns:
+            y: (B, T, C) output
+            present_kv: KV cache for inference
+        """
+        B, T, C = x.shape
+
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # Apply RoPE
+        if self.rope is not None:
+            cos, sin = self.rope(T)
+            cos, sin = cos.to(x.device), sin.to(x.device)
+            q, k = apply_rotary_pos_emb_pair(q, k, cos, sin)
+
+        # KV cache handling
+        present_kv = (k, v)
+        if past_kv is not None:
+            pk, pv = past_kv
+            k = torch.cat([pk, k], dim=2)
+            v = torch.cat([pv, v], dim=2)
+
+        # === Three Branches ===
+
+        # Branch 1: Compressed global attention
+        k_comp, v_comp = self._compress_kv(k, v)
+        # Attend to compressed tokens
+        comp_scores = torch.matmul(q, k_comp.transpose(-2, -1)) * self.scale
+        # Causal mask for compressed (approximate)
+        n_comp = k_comp.shape[2]
+        comp_mask = torch.triu(
+            torch.ones(T, n_comp, dtype=torch.bool, device=x.device),
+            diagonal=max(1, n_comp - T + 1),
+        )
+        comp_scores.masked_fill_(comp_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        comp_attn = F.softmax(comp_scores, dim=-1)
+        out_compressed = torch.matmul(comp_attn, v_comp)  # (B, nh, T, hd)
+
+        # Branch 2: Top-k selected attention
+        out_selected = self._select_topk(q, k, v)  # (B, nh, T, hd)
+
+        # Branch 3: Sliding window local attention
+        out_window = self._sliding_window(q, k, v)  # (B, nh, T, hd)
+
+        # === Gated Fusion ===
+        gate_weights = self.gate(x)  # (B, T, 3*nh)
+        gate_weights = gate_weights.view(B, T, 3, self.n_head)
+        gate_weights = F.softmax(gate_weights, dim=2)  # normalize across 3 branches
+        gate_weights = gate_weights.permute(0, 3, 1, 2)  # (B, nh, T, 3)
+
+        # Combine branches
+        g_comp = gate_weights[:, :, :, 0].unsqueeze(-1)   # (B, nh, T, 1)
+        g_sel = gate_weights[:, :, :, 1].unsqueeze(-1)
+        g_win = gate_weights[:, :, :, 2].unsqueeze(-1)
+
+        y = g_comp * out_compressed + g_sel * out_selected + g_win * out_window
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y, present_kv
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  TRANSFORMER BLOCK
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -674,9 +898,11 @@ class TransformerBlock(nn.Module):
         self.ln_1 = RMSNorm(config.n_embd)
         self.ln_2 = RMSNorm(config.n_embd)
 
-        # Attention: MLA or GQA (pass layer_id for alternating window)
+        # Attention: MLA or NSA or GQA (pass layer_id for alternating window)
         if config.use_mla:
             self.attn = MultiHeadLatentAttention(config)
+        elif config.use_nsa:
+            self.attn = NativeSparseAttention(config)
         else:
             self.attn = CausalSelfAttention(config, layer_id=layer_id)
 

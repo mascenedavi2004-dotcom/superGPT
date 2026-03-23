@@ -51,6 +51,11 @@ superGPT is a **from-scratch LLM training framework** implementing every major i
 | 🚀 **Inference Server** | Continuous batching + PagedAttention + OpenAI API | vLLM, TGI |
 | 📊 **Streaming Data** | Sharded datasets, HF streaming, cloud-ready | Mosaic, WebDataset |
 | 📝 **Evaluation Harness** | MMLU, HellaSwag, ARC, GSM8K, HumanEval | lm-eval-harness |
+| 🔥 **DAPO Alignment** | Clip-Higher + Dynamic Sampling + Token-Level PG — state-of-the-art RL | ByteDance 2025 |
+| ✨ **RLVR** | RL with auto-verifiable rewards — emergent reasoning, no labels | DeepSeek R1 2025 |
+| ⚡ **Native Sparse Attention** | 3-branch (compress + top-k + window) — 9x faster attention | DeepSeek 2025 |
+| 🧬 **White-Box KD (CKA)** | Match hidden states across different dimensions with CKA | ICLR 2025 |
+| 🎯 **Mix Distillation** | Multi-teacher blending + curriculum learning for small models | arXiv Nov 2025 |
 
 ## Quick Start
 

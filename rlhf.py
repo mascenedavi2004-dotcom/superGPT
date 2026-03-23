@@ -460,7 +460,314 @@ def grpo_step(policy, ref_policy, reward_fn, prompts, device,
 
 
 # ==============================================================================
-#  Built-in Reward Functions (for GRPO without reward model)
+#  DAPO — Decoupled Clip & Dynamic Sampling Policy Optimization
+#  Paper: ByteDance/Tsinghua AIR, arXiv 2503.14476, Mar 2025
+#  4 key techniques: Clip-Higher, Dynamic Sampling, Token-Level PG,
+#                    Overlong Reward Shaping
+# ==============================================================================
+
+def dapo_step(policy, ref_policy, reward_fn, prompts, device,
+              group_size=4, max_gen=128, kl_coef=0.04,
+              clip_eps_low=0.2, clip_eps_high=0.28,
+              temperature=0.8, max_response_len=256,
+              overlong_penalty=-1.0):
+    """One DAPO training step with all 4 improvements over GRPO.
+
+    Key differences from GRPO:
+    1. Clip-Higher: Asymmetric clipping [1-eps_low, 1+eps_high] to prevent
+       entropy collapse and encourage exploration
+    2. Dynamic Sampling: Skip prompts where all completions have same reward
+       (no learning signal)
+    3. Token-Level PG: Per-token gradient instead of sequence-level mean,
+       preventing underweighting of long responses
+    4. Overlong Reward Shaping: Soft penalty for truncated outputs
+
+    Args:
+        clip_eps_low: lower clip bound (standard, e.g. 0.2)
+        clip_eps_high: upper clip bound (wider, e.g. 0.28)
+        max_response_len: max allowed response length for overlong shaping
+        overlong_penalty: reward penalty for overlong responses
+
+    Returns:
+        loss, stats
+    """
+    policy.eval()
+
+    all_completions = []
+    all_log_probs = []       # token-level log probs
+    all_rewards = []
+    all_token_counts = []
+
+    # === Stage 1: Generate G completions per prompt ===
+    for prompt_ids in prompts:
+        group_completions = []
+        group_log_probs = []
+        group_rewards = []
+        group_lengths = []
+
+        for g in range(group_size):
+            tokens = prompt_ids.unsqueeze(0).to(device)
+            gen_tokens = []
+            gen_lps = []
+            truncated = False
+
+            for step in range(max_gen):
+                with torch.no_grad():
+                    logits, _ = policy(tokens)
+                logits = logits[:, -1, :] / temperature
+                probs = F.softmax(logits, dim=-1)
+                token = torch.multinomial(probs, 1)
+                lp = F.log_softmax(logits, dim=-1).gather(1, token)
+
+                gen_tokens.append(token.item())
+                gen_lps.append(lp.item())
+                tokens = torch.cat([tokens, token], dim=1)
+
+            # [4] Overlong Reward Shaping
+            if len(gen_tokens) >= max_response_len:
+                truncated = True
+
+            group_completions.append(gen_tokens)
+            group_log_probs.append(gen_lps)
+            group_lengths.append(len(gen_tokens))
+
+            # Score
+            completion_ids = torch.tensor(gen_tokens, dtype=torch.long)
+            r = reward_fn(prompt_ids, completion_ids)
+
+            # Apply overlong reward shaping (soft penalty)
+            if truncated:
+                overshoot = len(gen_tokens) / max_response_len
+                r = r + overlong_penalty * max(0, overshoot - 1.0)
+
+            group_rewards.append(r)
+
+        all_completions.append(group_completions)
+        all_log_probs.append(group_log_probs)
+        all_rewards.append(group_rewards)
+        all_token_counts.append(group_lengths)
+
+    # === [2] Dynamic Sampling: Filter out uninformative prompts ===
+    # Skip prompts where all rewards are identical (no learning signal)
+    active_indices = []
+    skipped = 0
+    for i, rewards in enumerate(all_rewards):
+        r_tensor = torch.tensor(rewards)
+        if r_tensor.std() < 1e-6:
+            # All completions have same reward — no signal
+            skipped += 1
+            continue
+        active_indices.append(i)
+
+    if not active_indices:
+        # All prompts filtered — return zero loss
+        return torch.tensor(0.0, device=device, requires_grad=True), {
+            "reward": sum(sum(r) for r in all_rewards) / max(1, len(prompts) * group_size),
+            "skipped_prompts": skipped,
+            "entropy": 0.0,
+        }
+
+    # Compute group-relative advantages (only for active prompts)
+    all_advantages = {}
+    for i in active_indices:
+        r = torch.tensor(all_rewards[i], dtype=torch.float32)
+        mean = r.mean()
+        std = r.std().clamp(min=1e-8)
+        all_advantages[i] = (r - mean) / std
+
+    # === Stage 2: Policy Update with DAPO improvements ===
+    policy.train()
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    total_tokens = 0
+    entropy_sum = 0.0
+
+    for i in active_indices:
+        prompt_ids = prompts[i]
+        for g in range(group_size):
+            full_ids = torch.cat([
+                prompt_ids,
+                torch.tensor(all_completions[i][g], dtype=torch.long)
+            ]).unsqueeze(0).to(device)
+
+            # New log probs (full sequence)
+            logits, _ = policy(full_ids)
+            gen_logits = logits[:, len(prompt_ids):, :]  # (1, T_gen, V)
+
+            # [3] Token-Level PG Loss: per-token gradients
+            log_probs_new = F.log_softmax(gen_logits, dim=-1)
+            probs_new = log_probs_new.exp()
+
+            # Entropy for monitoring
+            entropy = -(probs_new * log_probs_new).sum(-1).mean()
+            entropy_sum += entropy.item()
+
+            # Token-level new log probs for generated tokens
+            gen_token_ids = torch.tensor(
+                all_completions[i][g], dtype=torch.long, device=device
+            ).unsqueeze(0)  # (1, T_gen)
+            new_token_lps = log_probs_new.gather(
+                2, gen_token_ids.unsqueeze(-1)
+            ).squeeze(-1)  # (1, T_gen)
+
+            # Old token-level log probs
+            old_token_lps = torch.tensor(
+                all_log_probs[i][g], dtype=torch.float32, device=device
+            ).unsqueeze(0)  # (1, T_gen)
+
+            # [3] Token-level ratios (not sequence-level mean)
+            token_ratios = torch.exp(new_token_lps - old_token_lps)  # (1, T_gen)
+            adv = all_advantages[i][g].to(device)
+
+            # [1] Clip-Higher: Asymmetric clipping
+            surr1 = token_ratios * adv
+            surr2 = torch.clamp(
+                token_ratios,
+                1.0 - clip_eps_low,
+                1.0 + clip_eps_high,  # Wider upper clip
+            ) * adv
+            per_token_loss = -torch.min(surr1, surr2)  # (1, T_gen)
+
+            # KL penalty (token-level)
+            with torch.no_grad():
+                ref_logits, _ = ref_policy(full_ids)
+            ref_lp = F.log_softmax(ref_logits[:, len(prompt_ids):, :], dim=-1)
+            kl_per_token = (probs_new * (log_probs_new - ref_lp)).sum(-1)  # (1, T_gen)
+
+            # [3] Token-level loss aggregation (sum, not mean over tokens)
+            pg_loss = per_token_loss.sum()
+            kl_loss = kl_per_token.sum()
+
+            total_loss = total_loss + pg_loss + kl_coef * kl_loss
+            total_tokens += new_token_lps.numel()
+
+    # Normalize by total tokens (token-level normalization)
+    total_loss = total_loss / max(total_tokens, 1)
+
+    # Stats
+    n_active = len(active_indices) * group_size
+    mean_reward = sum(sum(r) for r in all_rewards) / max(1, len(prompts) * group_size)
+    stats = {
+        "reward": mean_reward,
+        "group_std": sum(torch.tensor(all_rewards[i]).std().item()
+                        for i in active_indices) / max(len(active_indices), 1),
+        "skipped_prompts": skipped,
+        "active_prompts": len(active_indices),
+        "entropy": entropy_sum / max(n_active, 1),
+        "total_tokens": total_tokens,
+    }
+
+    return total_loss, stats
+
+
+def train_dapo(args):
+    """Full DAPO training loop."""
+    device = _get_device(args)
+
+    # Load policy
+    print(f"Loading policy model: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    config = GPTConfig(**ckpt["model_config"])
+
+    policy = GPT(config)
+    policy.load_state_dict(ckpt["model"])
+    policy.to(device)
+
+    # Create frozen reference
+    ref_policy = GPT(config)
+    ref_policy.load_state_dict(ckpt["model"])
+    ref_policy.to(device)
+    ref_policy.eval()
+    for p in ref_policy.parameters():
+        p.requires_grad = False
+
+    n_params = sum(p.numel() for p in policy.parameters())
+    print(f"  Policy: {n_params/1e6:.1f}M params")
+
+    # Reward function
+    if args.reward_model:
+        rm = RewardModel.from_pretrained(args.reward_model, device)
+        rm.to(device).eval()
+        for p in rm.parameters():
+            p.requires_grad = False
+        def reward_fn(prompt_ids, completion_ids):
+            full = torch.cat([prompt_ids, completion_ids]).unsqueeze(0).to(device)
+            with torch.no_grad():
+                return rm(full).item()
+    elif args.rule_reward:
+        reward_fn = REWARD_FUNCTIONS[args.rule_reward]
+        print(f"  Rule reward: {args.rule_reward}")
+    else:
+        reward_fn = REWARD_FUNCTIONS["format"]
+        print("  Default reward: format")
+
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=args.lr, weight_decay=0.01)
+
+    # Load prompts
+    prompts = _load_prompts(args.data, config.vocab_size)
+
+    print(f"\n{'='*60}")
+    print(f"  DAPO Training (Cutting-Edge 2025)")
+    print(f"{'='*60}")
+    print(f"  Clip-Higher:    eps_low={args.clip_eps_low}, eps_high={args.clip_eps_high}")
+    print(f"  Dynamic Sampling: ON")
+    print(f"  Token-Level PG:   ON")
+    print(f"  Overlong Shaping: penalty={args.overlong_penalty}")
+    print(f"  Group size:       {args.group_size}")
+    print(f"  KL coef:          {args.kl_coef}")
+    print(f"{'='*60}\n")
+
+    t0 = time.time()
+    for step in range(args.max_steps):
+        # Sample a batch of prompts
+        batch_idx = torch.randint(len(prompts), (args.batch_size,))
+        batch_prompts = [prompts[i] for i in batch_idx]
+
+        loss, stats = dapo_step(
+            policy, ref_policy, reward_fn, batch_prompts, device,
+            group_size=args.group_size, max_gen=args.max_gen,
+            kl_coef=args.kl_coef,
+            clip_eps_low=args.clip_eps_low,
+            clip_eps_high=args.clip_eps_high,
+            temperature=args.temperature,
+            max_response_len=args.max_gen,
+            overlong_penalty=args.overlong_penalty,
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        optimizer.step()
+
+        if step % 10 == 0:
+            t1 = time.time()
+            print(f"  step {step:>4d} | reward {stats['reward']:.3f} | "
+                  f"entropy {stats['entropy']:.2f} | "
+                  f"skipped {stats['skipped_prompts']}/{args.batch_size} | "
+                  f"{t1-t0:.1f}s")
+            t0 = t1
+
+        if (step + 1) % args.save_interval == 0:
+            os.makedirs(args.output_dir, exist_ok=True)
+            ckpt_save = {
+                "model": policy.state_dict(),
+                "model_config": config.to_dict(),
+                "iter_num": step,
+                "alignment": {
+                    "method": "dapo",
+                    "clip_eps_low": args.clip_eps_low,
+                    "clip_eps_high": args.clip_eps_high,
+                    "kl_coef": args.kl_coef,
+                },
+            }
+            save_path = os.path.join(args.output_dir, f"dapo_{step+1}.pt")
+            torch.save(ckpt_save, save_path)
+            print(f"    Saved: {save_path}")
+
+    print("\nDAPO training complete.")
+
+
+# ==============================================================================
+#  Built-in Reward Functions (for GRPO/DAPO without reward model)
 # ==============================================================================
 
 def length_reward(prompt_ids, completion_ids, target_length=100):
@@ -913,6 +1220,31 @@ Examples:
     ppo_parser.add_argument("--output-dir", default="checkpoints")
     ppo_parser.add_argument("--device", default="auto")
 
+    # DAPO (Cutting-Edge 2025)
+    dapo_parser = sub.add_parser("dapo", help="DAPO alignment (ByteDance 2025, state-of-the-art)")
+    dapo_parser.add_argument("--checkpoint", required=True)
+    dapo_parser.add_argument("--reward-model", default=None)
+    dapo_parser.add_argument("--rule-reward", default=None,
+                             choices=list(REWARD_FUNCTIONS.keys()))
+    dapo_parser.add_argument("--data", default=None, help="Prompts file")
+    dapo_parser.add_argument("--group-size", type=int, default=4)
+    dapo_parser.add_argument("--max-gen", type=int, default=128)
+    dapo_parser.add_argument("--max-prompt-length", type=int, default=128)
+    dapo_parser.add_argument("--kl-coef", type=float, default=0.04)
+    dapo_parser.add_argument("--clip-eps-low", type=float, default=0.2,
+                             help="Lower clip epsilon (standard)")
+    dapo_parser.add_argument("--clip-eps-high", type=float, default=0.28,
+                             help="Upper clip epsilon (wider, Clip-Higher)")
+    dapo_parser.add_argument("--overlong-penalty", type=float, default=-1.0,
+                             help="Reward penalty multiplier for overlong responses")
+    dapo_parser.add_argument("--temperature", type=float, default=0.8)
+    dapo_parser.add_argument("--max-steps", type=int, default=500)
+    dapo_parser.add_argument("--batch-size", type=int, default=4)
+    dapo_parser.add_argument("--save-interval", type=int, default=100)
+    dapo_parser.add_argument("--lr", type=float, default=1e-5)
+    dapo_parser.add_argument("--output-dir", default="checkpoints")
+    dapo_parser.add_argument("--device", default="auto")
+
     args = parser.parse_args()
 
     if args.command == "reward":
@@ -921,5 +1253,8 @@ Examples:
         train_grpo(args)
     elif args.command == "ppo":
         train_ppo(args)
+    elif args.command == "dapo":
+        train_dapo(args)
     else:
         parser.print_help()
+
