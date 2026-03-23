@@ -50,8 +50,8 @@ NanoForge is a **from-scratch LLM training framework** implementing every major 
 
 ```bash
 # Clone and setup
-git clone https://github.com/viralcode/nanoforge.git
-cd nanoforge
+git clone https://github.com/viralcode/microGPT.git
+cd microGPT
 pip install torch numpy
 
 # Prepare data (included Shakespeare dataset, or use your own)
