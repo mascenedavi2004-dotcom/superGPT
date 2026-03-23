@@ -26,8 +26,8 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
-from config import GPTConfig, TrainConfig, get_model_config
-from model import GPT
+from supergpt.core.config import GPTConfig, TrainConfig, get_model_config
+from supergpt.core.model import GPT
 
 
 # ── FSDP imports (optional) ──────────────────────────────────────────────────
@@ -489,7 +489,7 @@ if __name__ == "__main__":
     # If streaming is requested, monkey-patch load_data with streaming loader
     if args.streaming or args.hf_dataset or args.shard_dir:
         try:
-            from streaming import create_streaming_dataloader
+            from supergpt.training.streaming import create_streaming_dataloader
             _stream_loader = create_streaming_dataloader(
                 block_size=model_config.block_size,
                 batch_size=train_config.batch_size,

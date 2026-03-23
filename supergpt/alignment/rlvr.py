@@ -41,8 +41,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import GPTConfig, get_model_config
-from model import GPT
+from supergpt.core.config import GPTConfig, get_model_config
+from supergpt.core.model import GPT
 
 
 # ==============================================================================
@@ -461,7 +461,7 @@ def train_rlvr(args):
             )
 
         # DAPO step with verifiable rewards
-        from rlhf import dapo_step
+        from supergpt.alignment.rlhf import dapo_step
         loss, stats = dapo_step(
             policy, ref_policy, rlvr_reward, batch_prompts, device,
             group_size=args.group_size, max_gen=args.max_gen,

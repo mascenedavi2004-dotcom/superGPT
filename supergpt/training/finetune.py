@@ -28,9 +28,9 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
-from config import GPTConfig
-from model import GPT
-from lora import apply_lora, merge_lora, save_lora
+from supergpt.core.config import GPTConfig
+from supergpt.core.model import GPT
+from supergpt.training.lora import apply_lora, merge_lora, save_lora
 
 
 def load_data(data_dir: str, split: str, block_size: int, batch_size: int, device: str):

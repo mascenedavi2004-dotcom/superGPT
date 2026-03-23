@@ -45,8 +45,8 @@ from typing import List, Dict, Optional
 import torch
 import torch.nn.functional as F
 
-from config import GPTConfig
-from model import GPT
+from supergpt.core.config import GPTConfig
+from supergpt.core.model import GPT
 
 
 # ==============================================================================

@@ -34,8 +34,8 @@ import numpy as np
 
 import torch
 
-from config import GPTConfig
-from model import GPT
+from supergpt.core.config import GPTConfig
+from supergpt.core.model import GPT
 
 
 # GGUF Constants

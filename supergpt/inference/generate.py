@@ -35,8 +35,8 @@ import pickle
 
 import torch
 
-from config import GPTConfig
-from model import GPT, SpeculativeGenerator
+from supergpt.core.config import GPTConfig
+from supergpt.core.model import GPT, SpeculativeGenerator
 
 
 def load_model(checkpoint_path: str, device: str):

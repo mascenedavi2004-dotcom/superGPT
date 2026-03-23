@@ -40,8 +40,8 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from config import GPTConfig
-from model import GPT
+from supergpt.core.config import GPTConfig
+from supergpt.core.model import GPT
 
 
 def load_model(checkpoint_path: str, device: str):
