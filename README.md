@@ -427,6 +427,7 @@ superGPT/
 |----------|-------------|
 | [**Getting Started**](tutorials/getting-started.md) | Complete guide to superGPT — installation, architecture, all model presets, data preparation, training, text generation, LoRA fine-tuning, distillation, multi-GPU FSDP, and troubleshooting. |
 | [**Training Data Guide**](tutorials/training-data-guide.md) | How to prepare training data from scratch — web crawling, text extraction, quality filtering, deduplication, cleaning, custom data from GitHub/Google/PDFs, synthetic data generation (Magpie, Evol-Instruct), tokenization, data mixing, and curriculum learning. |
+| [**Instruction Tuning & Chat**](tutorials/instruction-tuning-chat.md) | Turn a base model into ChatGPT — the complete 4-stage pipeline: SFT with LoRA, DPO alignment, RLHF/GRPO, RLVR (DeepSeek-R1 style). Includes 20+ instruction datasets, chat templates, OpenAI-compatible serving, and reasoning model training. |
 | [**Deploy on RunPod**](tutorials/deploy-runpod.md) | Step-by-step guide to renting cloud GPUs on RunPod and training superGPT models — GPU selection, SSH setup, background training, monitoring, downloading checkpoints, multi-GPU, and cost optimization. |
 
 ## License
