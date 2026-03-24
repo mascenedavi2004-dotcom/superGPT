@@ -209,9 +209,10 @@ def generate_text(
             )
     t1 = time.time()
 
-    # Decode
+    # Decode (filter out token 0 — padding/special token that some models learn to insert)
     generated_ids = y[0].tolist()
-    text = tokenizer.decode(generated_ids)
+    filtered_ids = [t for t in generated_ids if t != 0]
+    text = tokenizer.decode(filtered_ids)
 
     # Stats
     n_generated = len(generated_ids) - len(prompt_ids)

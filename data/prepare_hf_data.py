@@ -59,6 +59,9 @@ def prepare_hf_data(
             if not text or not text.strip():
                 continue
             ids = tokenizer.encode(text, add_special_tokens=False)
+            # Filter out token 0 (padding/special token) to prevent the model
+            # from learning to insert separators between every real token
+            ids = [t for t in ids if t != 0]
             all_ids.extend(ids)
             count += 1
             if max_n and count >= max_n:
