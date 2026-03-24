@@ -11,12 +11,18 @@
 3. [Phase 2: Text Extraction](#3-phase-2-text-extraction)
 4. [Phase 3: Quality Filtering](#4-phase-3-quality-filtering)
 5. [Phase 4: Deduplication](#5-phase-4-deduplication)
-6. [Phase 5: Domain-Specific Data](#6-phase-5-domain-specific-data)
-7. [Phase 6: Tokenization](#7-phase-6-tokenization)
-8. [Phase 7: Data Mixing & Packaging](#8-phase-7-data-mixing--packaging)
-9. [Phase 8: Training at Scale](#9-phase-8-training-at-scale)
-10. [Phase 9: Post-Training (SFT + RLHF)](#10-phase-9-post-training-sft--rlhf)
-11. [Appendix: Open Datasets](#11-appendix-open-datasets)
+6. [Phase 5: Text Cleaning & Normalization](#6-phase-5-text-cleaning--normalization)
+7. [Phase 6: Domain-Specific Data](#7-phase-6-domain-specific-data)
+8. [Phase 7: Custom Data — GitHub, Google, PDFs, APIs](#8-phase-7-custom-data--github-google-pdfs-apis)
+9. [Phase 8: Synthetic Data Generation](#9-phase-8-synthetic-data-generation)
+10. [Phase 9: Tokenization](#10-phase-9-tokenization)
+11. [Phase 10: Data Mixing & Packaging](#11-phase-10-data-mixing--packaging)
+12. [Phase 11: Curriculum Learning & Data Scheduling](#12-phase-11-curriculum-learning--data-scheduling)
+13. [Phase 12: Training at Scale](#13-phase-12-training-at-scale)
+14. [Phase 13: Post-Training — SFT, DPO, RLHF](#14-phase-13-post-training--sft-dpo-rlhf)
+15. [Phase 14: End-to-End with superGPT](#15-phase-14-end-to-end-with-supergpt)
+16. [Appendix: Open Datasets](#16-appendix-open-datasets)
+17. [References](#references)
 
 ---
 
@@ -331,7 +337,123 @@ python -m text_dedup.suffix_array --input corpus.jsonl --output deduped.jsonl --
 
 ---
 
-## 6. Phase 5: Domain-Specific Data
+## 6. Phase 5: Text Cleaning & Normalization
+
+Even after filtering and dedup, raw text has encoding issues, invisible characters, and formatting problems that hurt training.
+
+### Unicode Normalization
+
+```python
+"""
+Unicode normalization — critical for consistent tokenization.
+Without this, 'é' (precomposed) and 'é' (e + combining accent) are different tokens.
+"""
+import unicodedata
+import re
+
+def normalize_unicode(text: str) -> str:
+    """Normalize to NFC form and clean problematic characters."""
+    # NFC: precompose characters (é as single char, not e + accent)
+    text = unicodedata.normalize('NFC', text)
+    
+    # Remove zero-width characters (invisible but break tokenization)
+    text = re.sub(r'[\u200b\u200c\u200d\ufeff\u00ad]', '', text)
+    
+    # Normalize quotes and dashes
+    text = text.replace('"', '"').replace('"', '"')
+    text = text.replace(''', "'").replace(''', "'")
+    text = text.replace('–', '-').replace('—', '-')
+    text = text.replace('…', '...')
+    
+    # Remove control characters (except newline, tab)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    
+    return text
+```
+
+### HTML & Markdown Cleaning
+
+```python
+"""
+Deep clean text extracted from web pages.
+Even after Trafilatura, some HTML artifacts remain.
+"""
+import re
+
+def deep_clean_text(text: str) -> str:
+    """Remove residual HTML, fix encoding, normalize whitespace."""
+    
+    # Remove any residual HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # Remove HTML entities
+    import html
+    text = html.unescape(text)
+    
+    # Fix common encoding artifacts
+    replacements = {
+        'â€™': "'", 'â€œ': '"', 'â€\x9d': '"',
+        'â€"': '—', 'â€"': '–', 'Â ': ' ',
+        'Ã©': 'é', 'Ã¡': 'á', 'Ã±': 'ñ',
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    
+    # Collapse excessive whitespace
+    text = re.sub(r'[ \t]+', ' ', text)          # Multiple spaces → one
+    text = re.sub(r'\n{3,}', '\n\n', text)        # 3+ newlines → 2
+    text = re.sub(r'(\n\s*){3,}', '\n\n', text)   # Blank lines
+    
+    # Remove lines that are just URLs
+    lines = text.split('\n')
+    lines = [l for l in lines if not re.match(r'^\s*https?://\S+\s*$', l)]
+    
+    # Remove lines that are just navigation (short repeated patterns)
+    lines = [l for l in lines if len(l.strip()) > 3 or l.strip() == '']
+    
+    return '\n'.join(lines).strip()
+```
+
+### Full Cleaning Pipeline
+
+```python
+"""
+Complete text cleaning pipeline — run this on every document
+AFTER extraction and BEFORE tokenization.
+"""
+
+def clean_document(text: str) -> str | None:
+    """Full cleaning pipeline. Returns None if document should be dropped."""
+    
+    # Step 1: Unicode normalize
+    text = normalize_unicode(text)
+    
+    # Step 2: Deep clean (HTML artifacts, encoding issues)
+    text = deep_clean_text(text)
+    
+    # Step 3: Remove excessive repetition within document
+    lines = text.split('\n')
+    seen_lines = set()
+    deduped_lines = []
+    for line in lines:
+        stripped = line.strip().lower()
+        if stripped and stripped in seen_lines:
+            continue  # Skip duplicate lines within same document
+        seen_lines.add(stripped)
+        deduped_lines.append(line)
+    text = '\n'.join(deduped_lines)
+    
+    # Step 4: Final length check
+    words = text.split()
+    if len(words) < 50:
+        return None  # Too short after cleaning
+    
+    return text
+```
+
+---
+
+## 7. Phase 6: Domain-Specific Data
 
 ### 6.1 Code (17-20% of training mix)
 
