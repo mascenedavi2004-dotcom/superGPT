@@ -519,8 +519,9 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
     )
 
     # ── Training Monitor ──────────────────────────────────────────────────
+    monitor_backend = getattr(train_config, 'monitor_backend', 'none')
     monitor = TrainingMonitor(
-        enabled=getattr(train_config, 'use_wandb', False),
+        enabled=(monitor_backend != 'none'),
         project="superGPT",
         run_name=f"{model_config.n_layer}L-{model_config.n_embd}E-{train_config.batch_size}B",
         config={
@@ -529,6 +530,7 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
             "lr": train_config.learning_rate,
             "max_iters": train_config.max_iters,
         },
+        backend=monitor_backend,
     )
 
     # ── Resume from checkpoint (with auto-resume) ─────────────────────────
@@ -737,6 +739,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Determine monitoring backend
+    monitor_backend = "none"
+    if args.wandb:
+        monitor_backend = "wandb"
+    elif args.tensorboard:
+        monitor_backend = "tensorboard"
+
     model_config = get_model_config(args.preset)
     train_config = TrainConfig(
         data_dir=args.data_dir,
@@ -750,12 +759,14 @@ if __name__ == "__main__":
         distributed=args.distributed,
         gradient_checkpointing=args.gradient_checkpointing,
         lr_schedule=args.lr_schedule,
+        use_wandb=args.wandb,
+        monitor_backend=monitor_backend,
     )
 
     # If streaming is requested, monkey-patch load_data with streaming loader
     if args.streaming or args.hf_dataset or args.shard_dir:
         try:
-            from supergpt.training.streaming import create_streaming_dataloader
+            from supergpt.training.data_pipeline import create_streaming_dataloader
             _stream_loader = create_streaming_dataloader(
                 block_size=model_config.block_size,
                 batch_size=train_config.batch_size,

@@ -117,6 +117,10 @@ class TrainConfig:
     save_interval: int = 1000
     resume_from: str = ""
 
+    # Monitoring
+    use_wandb: bool = False
+    monitor_backend: str = "none"  # "wandb", "tensorboard", "none"
+
 
 # ── Pre-built model size presets ──────────────────────────────────────────────
 
