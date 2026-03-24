@@ -192,6 +192,7 @@ class ExpertGate(nn.Module):
     Supports:
     - Softmax or sigmoid scoring
     - Auxiliary-loss-free routing via dynamic bias
+    - Group-limited routing (DeepSeek V3)
     - Standard auxiliary loss routing
     """
     def __init__(self, config: GPTConfig):
@@ -204,6 +205,10 @@ class ExpertGate(nn.Module):
         self.aux_loss_free = config.aux_loss_free
         self.bias_update_speed = config.bias_update_speed
         self.aux_loss_weight = config.moe_aux_loss_weight
+
+        # Group-limited routing (DeepSeek V3)
+        self.n_expert_groups = getattr(config, 'n_expert_groups', 1)
+        self.n_limited_groups = getattr(config, 'n_limited_groups', 1)
 
         self.weight = nn.Parameter(torch.empty(config.n_experts, config.n_embd))
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
@@ -245,6 +250,33 @@ class ExpertGate(nn.Module):
         else:
             routing_scores = scores
 
+        # ── Group-limited routing (DeepSeek V3) ──────────────────────────
+        if self.n_expert_groups > 1 and self.n_limited_groups < self.n_expert_groups:
+            N = x.shape[0]
+            experts_per_group = self.n_experts // self.n_expert_groups
+
+            # Reshape scores into groups: (N, n_groups, experts_per_group)
+            group_scores = routing_scores.view(N, self.n_expert_groups, experts_per_group)
+
+            # Score each group by its max expert score
+            group_max_scores = group_scores.max(dim=-1).values  # (N, n_groups)
+
+            # Select top groups
+            _, top_groups = group_max_scores.topk(self.n_limited_groups, dim=-1)  # (N, n_limited)
+
+            # Mask out experts in non-selected groups
+            group_mask = torch.zeros(N, self.n_expert_groups, device=x.device)
+            group_mask.scatter_(1, top_groups, 1.0)  # (N, n_groups)
+
+            # Expand mask to expert level
+            expert_mask = group_mask.unsqueeze(-1).expand(-1, -1, experts_per_group)
+            expert_mask = expert_mask.reshape(N, self.n_experts)  # (N, n_experts)
+
+            # Zero out scores for experts in non-selected groups
+            routing_scores = routing_scores * expert_mask + \
+                routing_scores.detach() * (1 - expert_mask) * float('-inf')
+            routing_scores = routing_scores.masked_fill(expert_mask == 0, float('-inf'))
+
         # Select top-k experts
         topk_scores, indices = torch.topk(routing_scores, self.topk, dim=-1)
 
@@ -274,8 +306,8 @@ class ExpertGate(nn.Module):
 
         # Standard aux loss (when not aux-loss-free)
         elif self.training and not self.aux_loss_free:
-            expert_mask = F.one_hot(indices, self.n_experts).float()
-            tokens_per_expert = expert_mask.sum(dim=(0, 1))
+            expert_mask_oh = F.one_hot(indices, self.n_experts).float()
+            tokens_per_expert = expert_mask_oh.sum(dim=(0, 1))
             N = x.shape[0]
             fraction_tokens = tokens_per_expert / (N * self.topk)
             fraction_probs = original_scores.mean(dim=0)
@@ -353,12 +385,13 @@ class MultiHeadLatentAttention(nn.Module):
     Compresses KV into a low-rank latent vector, reducing KV-cache by ~10x.
     Uses decoupled RoPE: separate positional key dims from content key dims.
 
-    KV Encoding:
-        [c_KV, k_rope] = W_KV_A @ h          # single projection
-        c_KV = RMSNorm(c_KV)
-        [k_nope, v] = W_KV_B @ c_KV          # up-project to all heads
-        k_rope = RoPE(k_rope)                 # position info
-        k = concat(k_nope, k_rope)            # final key
+    Two attention modes:
+      1. Naive: Decompress KV → full heads → standard attention
+         Q @ (W_KV_B @ c_KV)^T
+      2. Absorbed (DeepSeek V3 optimization):
+         Absorb W_KV_B into Q, attend in compressed latent space
+         (Q @ W_KV_B^T) @ c_KV^T
+         Avoids materializing full K,V per head → major inference speedup
 
     KV-Cache stores only (c_KV, k_rope) — NOT full K,V per head.
     """
@@ -414,6 +447,105 @@ class MultiHeadLatentAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
+    def _forward_naive(self, q_nope, q_rope, kv_latent, k_rope, B, T):
+        """Naive MLA: decompress KV → full heads → standard attention."""
+        kv_full = self.wkv_b(kv_latent)
+        kv_full = kv_full.view(B, -1, self.n_heads,
+                               self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv_full.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        k_nope = k_nope.transpose(1, 2)
+        k_rope_expanded = k_rope.expand(-1, self.n_heads, -1, -1)
+        k = torch.cat([k_nope, k_rope_expanded], dim=-1)
+
+        q_nope = q_nope.transpose(1, 2)
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        v = v.transpose(1, 2)
+
+        total_T = k.shape[2]
+        att = (q @ k.transpose(-2, -1)) * self.softmax_scale
+
+        if self.attn_logit_cap > 0:
+            att = att / self.attn_logit_cap
+            att = torch.tanh(att)
+            att = att * self.attn_logit_cap
+
+        if T > 1:
+            causal = torch.triu(
+                torch.full((T, total_T), float("-inf"), device=q.device), diagonal=1
+            )
+            att = att + causal.unsqueeze(0).unsqueeze(0)
+
+        att = att.softmax(dim=-1, dtype=torch.float32).type_as(q)
+        att = self.attn_dropout(att)
+        return att @ v
+
+    def _forward_absorbed(self, q_nope, q_rope, kv_latent, k_rope, B, T):
+        """Absorbed MLA: attend in compressed space without KV decompression.
+
+        Key insight: instead of Q @ (W_B @ c_KV)^T, compute (Q @ W_B^T) @ c_KV^T
+        This avoids materializing full K,V per head during inference.
+
+        For the content (nope) part:
+          W_KV_B projects latent → [k_nope, v] per head
+          We split W_KV_B into W_K_nope (latent→k_nope) and W_V (latent→v)
+          Then: attn_nope = (q_nope @ W_K_nope^T) @ c_KV^T
+          And:  output    = attn @ (W_V @ c_KV^T)^T = attn @ c_KV @ W_V^T
+        """
+        total_T = kv_latent.shape[1]
+
+        # Extract W_K_nope and W_V from the combined wkv_b weight
+        # wkv_b.weight shape: (n_heads * (nope + v_dim), kv_lora_rank)
+        w_full = self.wkv_b.weight  # (n_heads * (nope+v), lora_rank)
+        w_full = w_full.view(self.n_heads, self.qk_nope_head_dim + self.v_head_dim,
+                             self.kv_lora_rank)
+        w_k_nope = w_full[:, :self.qk_nope_head_dim, :]  # (nh, nope, lr)
+        w_v = w_full[:, self.qk_nope_head_dim:, :]        # (nh, v_dim, lr)
+
+        # Absorbed content attention: q_nope @ W_K_nope^T → (B, nh, T, lr)
+        # q_nope: (B, T, nh, nope) → (B, nh, T, nope)
+        q_nope = q_nope.transpose(1, 2)
+        # (B, nh, T, nope) @ (nh, nope, lr)^T → need einsum
+        # q_absorbed_nope[b,h,t,:] = q_nope[b,h,t,:] @ w_k_nope[h,:,:]^T
+        q_absorbed = torch.einsum('bhtn,hnl->bhtl', q_nope, w_k_nope)
+        # q_absorbed: (B, nh, T, kv_lora_rank)
+
+        # Nope attention scores: q_absorbed @ kv_latent^T
+        # kv_latent: (B, total_T, lora_rank) → (B, 1, total_T, lora_rank)
+        kv_lat = kv_latent.unsqueeze(1)  # broadcast over heads
+        att_nope = torch.matmul(q_absorbed, kv_lat.transpose(-2, -1))
+        # att_nope: (B, nh, T, total_T)
+
+        # RoPE attention scores: q_rope @ k_rope^T
+        k_rope_expanded = k_rope.expand(-1, self.n_heads, -1, -1)
+        att_rope = torch.matmul(q_rope, k_rope_expanded.transpose(-2, -1))
+        # att_rope: (B, nh, T, total_T)
+
+        # Combined attention
+        att = (att_nope + att_rope) * self.softmax_scale
+
+        if self.attn_logit_cap > 0:
+            att = att / self.attn_logit_cap
+            att = torch.tanh(att)
+            att = att * self.attn_logit_cap
+
+        if T > 1:
+            causal = torch.triu(
+                torch.full((T, total_T), float("-inf"), device=att.device), diagonal=1
+            )
+            att = att + causal.unsqueeze(0).unsqueeze(0)
+
+        att = att.softmax(dim=-1, dtype=torch.float32).type_as(q_nope)
+        att = self.attn_dropout(att)
+
+        # Absorbed value: att @ kv_latent → then project through W_V
+        # att: (B, nh, T, total_T), kv_latent: (B, total_T, lr)
+        latent_out = torch.matmul(att, kv_lat)  # (B, nh, T, lr)
+        # Project latent to value: latent_out @ w_v^T
+        y = torch.einsum('bhtl,hvl->bhtv', latent_out, w_v)
+        # y: (B, nh, T, v_dim)
+        return y
+
     def forward(self, x, past_kv=None):
         """
         Args:
@@ -449,18 +581,13 @@ class MultiHeadLatentAttention(nn.Module):
         offset = past_kv[0].shape[1] if past_kv is not None else 0
         cos, sin = self.rotary_emb(T, offset=offset)
 
-        # Apply RoPE to query rope dims: (B, T, n_heads, rope_dim) → transpose
-        q_rope = q_rope.transpose(1, 2)  # (B, n_heads, T, rope_dim)
+        q_rope = q_rope.transpose(1, 2)
         q_rope = apply_rotary_pos_emb(q_rope, cos, sin)
 
-        # Apply RoPE to key rope dims: shared across heads (B, T, 1, rope_dim)
-        k_rope = k_rope_raw.unsqueeze(2)  # (B, T, 1, rope_dim)
-        k_rope = k_rope.transpose(1, 2)   # (B, 1, T, rope_dim)
+        k_rope = k_rope_raw.unsqueeze(2).transpose(1, 2)
         k_rope = apply_rotary_pos_emb(k_rope, cos, sin)
 
         # ── KV-Cache ─────────────────────────────────────────────────────
-        # Store compressed representation: (kv_latent, k_rope)
-        # This is ~10x smaller than storing full K,V per head
         if past_kv is not None:
             past_latent, past_rope = past_kv
             kv_latent = torch.cat([past_latent, kv_latent], dim=1)
@@ -468,47 +595,15 @@ class MultiHeadLatentAttention(nn.Module):
 
         present_kv = (kv_latent, k_rope)
 
-        # ── Up-project KV from latent ────────────────────────────────────
-        kv_full = self.wkv_b(kv_latent)  # (B, total_T, n_heads * (nope + v))
-        kv_full = kv_full.view(B, -1, self.n_heads,
-                               self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv_full.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # ── Select attention mode ────────────────────────────────────────
+        # Use absorbed attention during inference (T=1, autoregressive)
+        # Use naive during training (batched, more numerically stable)
+        use_absorbed = (not self.training) and (T == 1)
 
-        # ── Assemble full K ──────────────────────────────────────────────
-        # k_nope: (B, total_T, n_heads, nope_dim)
-        # k_rope: (B, 1, total_T, rope_dim) → expand to (B, n_heads, total_T, rope_dim)
-        k_nope = k_nope.transpose(1, 2)  # (B, n_heads, total_T, nope_dim)
-        k_rope_expanded = k_rope.expand(-1, self.n_heads, -1, -1)
-        k = torch.cat([k_nope, k_rope_expanded], dim=-1)  # (B, n_heads, total_T, qk_dim)
-
-        # ── Assemble full Q ──────────────────────────────────────────────
-        q_nope = q_nope.transpose(1, 2)  # (B, n_heads, T, nope_dim)
-        q = torch.cat([q_nope, q_rope], dim=-1)  # (B, n_heads, T, qk_dim)
-
-        # v: (B, total_T, n_heads, v_dim) → (B, n_heads, total_T, v_dim)
-        v = v.transpose(1, 2)
-
-        # ── Attention ────────────────────────────────────────────────────
-        total_T = k.shape[2]
-        att = (q @ k.transpose(-2, -1)) * self.softmax_scale
-
-        # Logit soft-capping (Gemma 2)
-        if self.attn_logit_cap > 0:
-            att = att / self.attn_logit_cap
-            att = torch.tanh(att)
-            att = att * self.attn_logit_cap
-
-        # Causal mask
-        if past_kv is None and T > 1:
-            causal = torch.triu(
-                torch.full((T, total_T), float("-inf"), device=x.device), diagonal=1
-            )
-            att = att + causal.unsqueeze(0).unsqueeze(0)
-        # When using cache with T=1, no masking needed
-
-        att = att.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        att = self.attn_dropout(att)
-        y = att @ v  # (B, n_heads, T, v_dim)
+        if use_absorbed:
+            y = self._forward_absorbed(q_nope, q_rope, kv_latent, k_rope, B, T)
+        else:
+            y = self._forward_naive(q_nope, q_rope, kv_latent, k_rope, B, T)
 
         # ── Output ───────────────────────────────────────────────────────
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_heads * self.v_head_dim)
@@ -1131,6 +1226,9 @@ class GPT(nn.Module):
         # Final norm
         h = self.transformer.ln_f(x)
 
+        # Store hidden states for MTP speculative decoding
+        self._last_hidden = h
+
         if targets is not None:
             # ── Training: compute loss ────────────────────────────────────
             logits = self.lm_head(h)
@@ -1458,6 +1556,152 @@ class SpeculativeGenerator:
                     generated += 1
 
             if idx.size(1) >= self.target.config.block_size:
+                break
+
+        return idx
+
+
+class MTPSpeculativeGenerator:
+    """MTP-based speculative decoding: self-drafting without a separate model.
+
+    Uses the model's own Multi-Token Prediction heads (trained with MTP)
+    as the draft model. The MTP heads predict tokens 2, 3, ... k in
+    parallel from the main model's hidden states.
+
+    Advantage over SpeculativeGenerator:
+      - No separate draft model needed
+      - MTP heads are tiny (already in the model)
+      - Draft tokens come "free" from the training MTP heads
+
+    This is DeepSeek-V3's approach to speculative decoding.
+
+    Usage:
+        gen = MTPSpeculativeGenerator(model)
+        output_ids = gen.generate(input_ids, max_new_tokens=200)
+    """
+
+    def __init__(self, model: GPT):
+        assert model.mtp_modules is not None and len(model.mtp_modules) > 0, \
+            "Model must have MTP modules (n_predict_tokens > 1)"
+        self.model = model
+        self.n_drafts = len(model.mtp_modules)  # Number of extra draft tokens
+
+    @torch.no_grad()
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int = 200,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ) -> torch.Tensor:
+        """Generate using MTP self-speculative decoding.
+
+        For each step:
+        1. Run main model forward → hidden states h + token_1 logits
+        2. Use MTP heads on h → draft token_2, token_3, ... token_k logits
+        3. Sample all k tokens from their logits
+        4. Verify by running main model on all k tokens in one pass
+        5. Accept matching tokens, reject at first divergence
+
+        Returns:
+            idx: (B, prompt_len + generated) token IDs
+        """
+        self.model.eval()
+        device = idx.device
+        generated = 0
+
+        while generated < max_new_tokens:
+            # Trim to block_size
+            ctx = idx if idx.size(1) <= self.model.config.block_size \
+                else idx[:, -self.model.config.block_size:]
+
+            # Step 1: Main model forward (get hidden states + logits)
+            logits, _ = self.model(ctx)
+            last_h = self.model._last_hidden  # Hidden states from last forward
+
+            # Main model's next-token prediction
+            main_logits = logits[:, -1, :] / max(temperature, 1e-8)
+            if top_k is not None:
+                v, _ = torch.topk(main_logits, min(top_k, main_logits.size(-1)))
+                main_logits[main_logits < v[:, [-1]]] = float("-inf")
+            main_probs = torch.softmax(main_logits, dim=-1)
+            token_1 = torch.multinomial(main_probs, num_samples=1)
+
+            draft_tokens = [token_1]
+            draft_probs = [main_probs]
+
+            # Step 2: Use MTP heads for draft tokens 2..k
+            h = last_h  # (B, T, dim) — hidden states
+            prev_emb = self.model.transformer.wte(token_1)  # (B, 1, dim)
+
+            for mtp_mod in self.model.mtp_modules:
+                # MTP module produces next hidden state
+                h_mtp = mtp_mod(h[:, -1:, :], prev_emb)
+                mtp_logits = self.model.lm_head(h_mtp[:, -1, :])  # (B, V)
+                mtp_logits = mtp_logits / max(temperature, 1e-8)
+                if top_k is not None:
+                    v, _ = torch.topk(mtp_logits, min(top_k, mtp_logits.size(-1)))
+                    mtp_logits[mtp_logits < v[:, [-1]]] = float("-inf")
+                mtp_probs = torch.softmax(mtp_logits, dim=-1)
+                mtp_token = torch.multinomial(mtp_probs, num_samples=1)
+
+                draft_tokens.append(mtp_token)
+                draft_probs.append(mtp_probs)
+                prev_emb = self.model.transformer.wte(mtp_token)
+
+            # Step 3: Accept token_1 (from main model, always correct)
+            idx = torch.cat([idx, token_1], dim=1)
+            generated += 1
+
+            if generated >= max_new_tokens:
+                break
+
+            # Step 4: Verify draft tokens 2..k with one main model pass
+            if len(draft_tokens) > 1:
+                # Build verification sequence
+                verify_suffix = torch.cat(draft_tokens[1:], dim=1)  # (B, k-1)
+                verify_idx = torch.cat([idx, verify_suffix], dim=1)
+                verify_idx = verify_idx if verify_idx.size(1) <= self.model.config.block_size \
+                    else verify_idx[:, -self.model.config.block_size:]
+
+                verify_logits, _ = self.model(verify_idx)
+
+                # Check each draft token
+                prompt_len = idx.size(1)
+                for i in range(len(draft_tokens) - 1):
+                    if generated >= max_new_tokens:
+                        break
+
+                    verify_pos = prompt_len - 1 + i
+                    if verify_pos >= verify_logits.size(1):
+                        break
+
+                    # Target distribution at this position
+                    t_logits = verify_logits[:, verify_pos, :] / max(temperature, 1e-8)
+                    if top_k is not None:
+                        v, _ = torch.topk(t_logits, min(top_k, t_logits.size(-1)))
+                        t_logits[t_logits < v[:, [-1]]] = float("-inf")
+                    target_p = torch.softmax(t_logits, dim=-1)
+
+                    d_token = draft_tokens[i + 1]
+                    d_p = draft_probs[i + 1].gather(1, d_token)
+                    t_p = target_p.gather(1, d_token)
+
+                    # Acceptance: min(1, target_p / draft_p)
+                    ratio = (t_p / (d_p + 1e-10)).clamp(max=1.0)
+                    if torch.rand(1, device=device) < ratio:
+                        idx = torch.cat([idx, d_token], dim=1)
+                        generated += 1
+                    else:
+                        # Reject and sample correction
+                        adjusted = torch.clamp(target_p - draft_probs[i + 1], min=0)
+                        adjusted = adjusted / (adjusted.sum(dim=-1, keepdim=True) + 1e-10)
+                        correction = torch.multinomial(adjusted, num_samples=1)
+                        idx = torch.cat([idx, correction], dim=1)
+                        generated += 1
+                        break
+
+            if idx.size(1) >= self.model.config.block_size:
                 break
 
         return idx

@@ -1,806 +1,254 @@
 """
-Knowledge Distillation for superGPT
-======================================
-Train a smaller (student) model to mimic a larger (teacher) model.
-The student learns to match the teacher's output probability distribution
-using KL divergence, producing a smaller model with much of the teacher's
-capability.
+Knowledge Distillation Pipeline
+=================================
+Transfer knowledge from a large teacher model to a smaller student model.
+Supports logit distillation (KL divergence) and feature distillation.
 
-Supports two teacher modes:
-  1. superGPT checkpoint (--teacher checkpoints/large.pt)
-  2. HuggingFace model  (--hf-teacher Qwen/Qwen2.5-0.5B)
-
-This is the same technique used by:
-  - DeepSeek R1 Distill (671B -> 7B/14B/70B)
-  - Qwen distillation series
-  - DistilBERT, TinyLLaMA
-
-How it works:
-  1. Teacher model produces soft probability distributions (logits)
-  2. Student model is trained to match those distributions (KL divergence)
-  3. Optionally, student also trains on ground-truth tokens (cross-entropy)
-  4. Temperature scaling softens distributions for better knowledge transfer
+This is how DeepSeek distills R1 reasoning capabilities into V3.
 
 Usage:
-    # Distill from a HuggingFace model (Qwen, LLaMA, Mistral, etc.):
-    python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --student-preset small
-
-    # Distill from a larger superGPT model:
-    python distill.py --teacher checkpoints/large.pt --student-preset small
-
-    # Custom settings:
-    python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --student-preset medium \\
-                      --temperature 3.0 --alpha 0.7
-
-Requirements for HuggingFace mode:
-    pip install transformers datasets
-
-Reference:
-    Hinton et al., "Distilling the Knowledge in a Neural Network" (2015)
+  python -m supergpt.training.distill \
+    --teacher checkpoints/large.pt \
+    --student-preset small \
+    --data-dir data \
+    --temperature 4.0 \
+    --alpha 0.7
 """
 
 import os
-import sys
 import math
 import time
-import pickle
 import argparse
-from contextlib import nullcontext
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from supergpt.core.config import GPTConfig, get_model_config
+from supergpt.core.config import GPTConfig, TrainConfig, get_model_config
 from supergpt.core.model import GPT
 
 
-# ==============================================================================
-#  Teacher model wrappers
-# ==============================================================================
+def distillation_loss(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float = 4.0,
+    alpha: float = 0.7,
+) -> torch.Tensor:
+    """Combined distillation loss.
 
-class SuperGPTTeacher:
-    """Teacher wrapper for a superGPT checkpoint."""
-
-    def __init__(self, checkpoint_path, device):
-        print(f"Loading superGPT teacher: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        self.config = GPTConfig(**ckpt["model_config"])
-        self.model = GPT(self.config)
-        self.model.load_state_dict(ckpt["model"])
-        self.model.to(device)
-        self.model.eval()
-
-        for p in self.model.parameters():
-            p.requires_grad = False
-
-        self.vocab_size = self.config.vocab_size
-        self.block_size = self.config.block_size
-        self.n_params = sum(p.numel() for p in self.model.parameters())
-        print(f"  Teacher: {self.n_params/1e6:.1f}M params (frozen)")
-
-    @torch.no_grad()
-    def get_logits(self, input_ids):
-        """Get full-sequence logits from teacher."""
-        logits, _ = self.model(input_ids)
-        # If only last token returned (inference mode), force training-mode forward
-        if logits.size(1) == 1 and input_ids.size(1) > 1:
-            x = self.model.transformer.wte(input_ids)
-            if self.model.transformer.wpe is not None:
-                pos = torch.arange(input_ids.size(1), device=input_ids.device)
-                x = x + self.model.transformer.wpe(pos)
-            x = self.model.transformer.drop(x)
-            for block in self.model.transformer.h:
-                x, _ = block(x)
-            x = self.model.transformer.ln_f(x)
-            logits = self.model.lm_head(x)
-        return logits
-
-
-class HuggingFaceTeacher:
-    """Teacher wrapper for any HuggingFace causal LM (Qwen, LLaMA, Mistral, etc.).
-
-    Usage:
-        teacher = HuggingFaceTeacher("Qwen/Qwen2.5-0.5B", device="cuda")
-        teacher = HuggingFaceTeacher("meta-llama/Llama-3.2-1B", device="cuda")
-    """
-
-    def __init__(self, model_name, device, dtype="auto"):
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-        except ImportError:
-            print("Error: HuggingFace mode requires the 'transformers' package.")
-            print("Install with: pip install transformers")
-            sys.exit(1)
-
-        print(f"Loading HuggingFace teacher: {model_name}")
-        print("  (This may download the model on first use)")
-
-        # Determine torch dtype
-        if dtype == "auto":
-            if device == "cuda" and torch.cuda.is_bf16_supported():
-                torch_dtype = torch.bfloat16
-            elif device == "cuda":
-                torch_dtype = torch.float16
-            else:
-                torch_dtype = torch.float32
-        else:
-            torch_dtype = getattr(torch, dtype)
-
-        # Load model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=True,
-        )
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype,
-            device_map=device if device == "cuda" else None,
-            trust_remote_code=True,
-        )
-        if device != "cuda":
-            self.model = self.model.to(device)
-
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
-
-        self.vocab_size = self.model.config.vocab_size
-        self.block_size = getattr(self.model.config, "max_position_embeddings", 4096)
-        self.n_params = sum(p.numel() for p in self.model.parameters())
-        self.model_name = model_name
-
-        print(f"  Teacher: {model_name} ({self.n_params/1e6:.1f}M params, frozen)")
-        print(f"  Vocab: {self.vocab_size} | Max ctx: {self.block_size}")
-
-    @torch.no_grad()
-    def get_logits(self, input_ids):
-        """Get full-sequence logits from teacher."""
-        outputs = self.model(input_ids)
-        return outputs.logits
-
-    def tokenize_text(self, text, max_length=512):
-        """Tokenize text using the teacher's tokenizer."""
-        tokens = self.tokenizer(
-            text, return_tensors="pt", truncation=True,
-            max_length=max_length, padding=False,
-        )
-        return tokens.input_ids
-
-
-# ==============================================================================
-#  Data loading
-# ==============================================================================
-
-def load_data_bin(data_dir, split, block_size, batch_size, device):
-    """Load data from pre-tokenized binary files (superGPT format)."""
-    data_path = os.path.join(data_dir, f"{split}.bin")
-    meta_path = os.path.join(data_dir, "meta.pkl")
-
-    if os.path.exists(meta_path):
-        with open(meta_path, "rb") as f:
-            meta = pickle.load(f)
-        dtype = np.uint32 if meta.get("tokenizer_type") == "tiktoken" else np.uint16
-    else:
-        dtype = np.uint16
-
-    data = np.memmap(data_path, dtype=dtype, mode="r")
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
-    return x.to(device), y.to(device)
-
-
-def load_data_hf(data_dir, split, block_size, batch_size, device, tokenizer):
-    """Load and tokenize text data using the HuggingFace teacher's tokenizer.
-
-    If pre-tokenized .bin files exist, loads from those.
-    Otherwise, reads text files and tokenizes on-the-fly.
-    """
-    bin_path = os.path.join(data_dir, f"{split}_hf.bin")
-
-    # Use cached tokenized data if available
-    if os.path.exists(bin_path):
-        data = np.memmap(bin_path, dtype=np.int32, mode="r")
-        ix = torch.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
-        return x.to(device), y.to(device)
-
-    # Fallback: read text and tokenize
-    text_path = os.path.join(data_dir, "input.txt")
-    if not os.path.exists(text_path):
-        print(f"Error: No data found. Need either {bin_path} or {text_path}")
-        sys.exit(1)
-
-    print(f"Tokenizing {text_path} with HuggingFace tokenizer (first time only)...")
-    with open(text_path, "r") as f:
-        text = f.read()
-
-    # Tokenize and cache
-    tokens = tokenizer(text, return_tensors="pt", truncation=False)["input_ids"][0]
-    tokens_np = tokens.numpy().astype(np.int32)
-
-    # Split 90/10
-    n = len(tokens_np)
-    split_idx = int(n * 0.9)
-
-    train_data = tokens_np[:split_idx]
-    val_data = tokens_np[split_idx:]
-
-    # Save cached versions
-    train_path = os.path.join(data_dir, "train_hf.bin")
-    val_path = os.path.join(data_dir, "val_hf.bin")
-    train_data.tofile(train_path)
-    val_data.tofile(val_path)
-    print(f"  Cached: {train_path} ({len(train_data)} tokens), "
-          f"{val_path} ({len(val_data)} tokens)")
-
-    # Return the requested split
-    data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
-    return x.to(device), y.to(device)
-
-
-# ==============================================================================
-#  Distillation loss
-# ==============================================================================
-
-def distillation_loss(student_logits, teacher_logits, targets,
-                      temperature=2.0, alpha=0.5):
-    """Compute combined distillation + cross-entropy loss.
+    L = α × KL(teacher || student) × T² + (1-α) × CE(student, labels)
 
     Args:
-        student_logits: (B, T, V_student) student model output
-        teacher_logits: (B, T, V_teacher) teacher model output (detached)
-        targets: (B, T) ground truth token IDs
-        temperature: softens distributions (higher = softer, more knowledge)
-        alpha: balance between distillation and CE (1.0 = pure distillation)
+        student_logits: (B, T, V) student model output
+        teacher_logits: (B, T, V) teacher model output (detached)
+        labels: (B, T) ground truth token IDs
+        temperature: Softmax temperature (higher = softer distribution)
+        alpha: Weight between distillation and hard label loss
 
     Returns:
-        loss, kd_loss_value, ce_loss_value
+        Combined loss scalar
     """
-    # Ensure same sequence length (truncate to shorter)
-    t_s = student_logits.size(1)
-    t_t = teacher_logits.size(1)
-    if t_s != t_t:
-        t_min = min(t_s, t_t)
-        student_logits = student_logits[:, :t_min, :]
-        teacher_logits = teacher_logits[:, :t_min, :]
-        targets = targets[:, :t_min]
+    V = student_logits.shape[-1]
 
-    # Handle vocab size mismatch (HF teacher may have different vocab)
-    v_student = student_logits.size(-1)
-    v_teacher = teacher_logits.size(-1)
+    # Soft targets from teacher (temperature-scaled)
+    teacher_soft = F.softmax(teacher_logits / temperature, dim=-1).detach()
+    student_log_soft = F.log_softmax(student_logits / temperature, dim=-1)
 
-    if v_student != v_teacher:
-        # Project to shared vocab space for KD loss
-        # Use the student's full vocab for KD (teacher logits truncated/padded)
-        v_min = min(v_student, v_teacher)
-        s_logits_kd = student_logits[..., :v_min]
-        t_logits_kd = teacher_logits[..., :v_min]
-    else:
-        s_logits_kd = student_logits
-        t_logits_kd = teacher_logits
-
-    B, T, V = s_logits_kd.shape
-
-    # KL Divergence on soft targets
-    student_soft = F.log_softmax(s_logits_kd / temperature, dim=-1)
-    teacher_soft = F.softmax(t_logits_kd / temperature, dim=-1)
-
-    kd_loss = F.kl_div(
-        student_soft.reshape(B * T, V),
-        teacher_soft.reshape(B * T, V),
+    # KL divergence (soft loss)
+    kl_loss = F.kl_div(
+        student_log_soft.view(-1, V),
+        teacher_soft.view(-1, V),
         reduction="batchmean",
-    )
-    # Scale by T^2 (Hinton et al.)
-    kd_loss = kd_loss * (temperature ** 2)
+    ) * (temperature ** 2)
 
-    # Standard cross-entropy on hard targets
-    # Clamp targets to student's vocab range
-    clamped_targets = targets.clamp(max=student_logits.size(-1) - 1)
+    # Hard label loss (standard CE)
     ce_loss = F.cross_entropy(
-        student_logits.reshape(-1, student_logits.size(-1)),
-        clamped_targets.reshape(-1),
+        student_logits.view(-1, V),
+        labels.view(-1),
         ignore_index=-1,
     )
 
-    # Combined loss
-    loss = alpha * kd_loss + (1 - alpha) * ce_loss
-
-    return loss, kd_loss.item(), ce_loss.item()
+    return alpha * kl_loss + (1 - alpha) * ce_loss
 
 
-# ==============================================================================
-#  WHITE-BOX KNOWLEDGE DISTILLATION — Hidden State Matching
-#  Papers: ICLR 2025 (CKA), DistilQwen2.5 (Apr 2025)
-# ==============================================================================
+class FeatureDistiller(nn.Module):
+    """Optional: align intermediate representations between teacher/student.
 
-def compute_cka(X, Y):
-    """Centered Kernel Alignment (CKA) — ICLR 2025.
-
-    Measures similarity between two sets of representations regardless of
-    dimensionality. This is the key innovation: student and teacher can have
-    different hidden dimensions.
-
-    CKA(X, Y) = ||Y^T X||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
-
-    Args:
-        X: (N, d1) student hidden states
-        Y: (N, d2) teacher hidden states
-    Returns:
-        CKA similarity in [0, 1]
+    Projects student hidden states to match teacher hidden states,
+    providing richer gradient signal than logit-only distillation.
     """
-    # Center the representations
-    X = X - X.mean(dim=0, keepdim=True)
-    Y = Y - Y.mean(dim=0, keepdim=True)
 
-    # Linear CKA
-    XtX = X.T @ X  # (d1, d1)
-    YtY = Y.T @ Y  # (d2, d2)
-    YtX = Y.T @ X  # (d2, d1)
+    def __init__(self, student_dim: int, teacher_dim: int, n_layers: int = 4):
+        super().__init__()
+        self.projectors = nn.ModuleList([
+            nn.Linear(student_dim, teacher_dim, bias=False)
+            for _ in range(n_layers)
+        ])
 
-    numerator = (YtX * YtX).sum()
-    denominator = torch.sqrt((XtX * XtX).sum() * (YtY * YtY).sum())
-
-    return numerator / (denominator + 1e-8)
-
-
-def hidden_state_loss(student_hidden, teacher_hidden, method="cka",
-                      projector=None):
-    """Compute hidden state matching loss between teacher and student layers.
-
-    Supports:
-    - CKA: Centered Kernel Alignment (works with different dims)
-    - MSE: Mean Squared Error (needs same dims or projector)
-    - cosine: Cosine similarity loss
-
-    Args:
-        student_hidden: (B, T, d_student) student layer output
-        teacher_hidden: (B, T, d_teacher) teacher layer output
-        method: "cka", "mse", or "cosine"
-        projector: optional nn.Linear to project student to teacher dim
-
-    Returns:
-        loss: scalar loss (lower = more similar)
-    """
-    B, T, d_s = student_hidden.shape
-    _, _, d_t = teacher_hidden.shape
-
-    # Flatten batch and time: (B*T, d)
-    s_flat = student_hidden.reshape(-1, d_s)
-    t_flat = teacher_hidden.reshape(-1, d_t).detach()
-
-    if method == "cka":
-        # CKA: works with different dimensions (key ICLR 2025 insight)
-        cka_score = compute_cka(s_flat, t_flat)
-        return 1.0 - cka_score  # We want to maximize CKA
-
-    elif method == "mse":
-        # MSE: project student to teacher dim if needed
-        if d_s != d_t:
-            if projector is not None:
-                s_flat = projector(s_flat)
-            else:
-                # Simple linear interpolation
-                s_flat = F.interpolate(
-                    s_flat.unsqueeze(0), size=d_t, mode='linear'
-                ).squeeze(0)
-        return F.mse_loss(s_flat, t_flat)
-
-    elif method == "cosine":
-        # Cosine: dimension-agnostic via pooling
-        if d_s != d_t:
-            min_d = min(d_s, d_t)
-            s_flat = s_flat[:, :min_d]
-            t_flat = t_flat[:, :min_d]
-        cos_sim = F.cosine_similarity(s_flat, t_flat, dim=-1)
-        return 1.0 - cos_sim.mean()
-
-    else:
-        raise ValueError(f"Unknown hidden loss method: {method}")
+    def forward(
+        self,
+        student_hiddens: list,
+        teacher_hiddens: list,
+    ) -> torch.Tensor:
+        """Compute MSE loss between projected student and teacher hiddens."""
+        loss = 0.0
+        n = min(len(self.projectors), len(student_hiddens), len(teacher_hiddens))
+        for i in range(n):
+            projected = self.projectors[i](student_hiddens[i])
+            loss += F.mse_loss(projected, teacher_hiddens[i].detach())
+        return loss / max(n, 1)
 
 
-def get_layer_mapping(n_student_layers, n_teacher_layers):
-    """Map student layers to teacher layers (forward mapping).
-
-    Paper insight: vanilla forward mapping works as well as complex strategies.
-    Maps student layer i to teacher layer floor(i * n_teacher / n_student).
-    """
-    mapping = {}
-    for i in range(n_student_layers):
-        j = int(i * n_teacher_layers / n_student_layers)
-        mapping[i] = min(j, n_teacher_layers - 1)
-    return mapping
+def load_model_from_checkpoint(checkpoint_path: str, device: str = "cpu"):
+    """Load a model from a training checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model_config_dict = checkpoint["model_config"]
+    model_config = GPTConfig(**model_config_dict)
+    model = GPT(model_config)
+    model.load_state_dict(checkpoint["model"])
+    return model, model_config
 
 
-# ==============================================================================
-#  MIX DISTILLATION — Multi-Teacher + Curriculum
-#  Paper: "Small Models Struggle to Learn from Strong Reasoners" (Nov 2025)
-# ==============================================================================
+def distill(
+    teacher_path: str,
+    student_preset: str = "small",
+    data_dir: str = "data",
+    max_iters: int = 5000,
+    batch_size: int = 32,
+    lr: float = 1e-4,
+    temperature: float = 4.0,
+    alpha: float = 0.7,
+    device: str = "auto",
+):
+    """Run knowledge distillation from teacher to student."""
+    import numpy as np
 
-def mix_teacher_logits(logits_large, logits_small, alpha_schedule, step,
-                       max_steps):
-    """Blend logits from a large and small teacher.
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    Key insight from Nov 2025 paper: small students learn better from a
-    MIX of large + small teacher outputs than from large teacher alone.
+    print(f"{'='*60}")
+    print(f"  Knowledge Distillation")
+    print(f"  Teacher: {teacher_path}")
+    print(f"  Student: {student_preset}")
+    print(f"  Temperature: {temperature}, Alpha: {alpha}")
+    print(f"  Device: {device}")
+    print(f"{'='*60}")
 
-    Annealing schedule: start with more weight on smaller teacher (easier),
-    gradually shift to larger teacher (harder).
+    # Load teacher
+    print("\nLoading teacher model...")
+    teacher, teacher_config = load_model_from_checkpoint(teacher_path, device)
+    teacher.to(device)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
 
-    Args:
-        logits_large: (B, T, V) logits from large teacher
-        logits_small: (B, T, V) logits from small teacher
-        alpha_schedule: "linear" or "cosine"
-        step: current training step
-        max_steps: total training steps
+    teacher_params = sum(p.numel() for p in teacher.parameters())
+    print(f"  Teacher: {teacher_params/1e6:.1f}M params")
 
-    Returns:
-        mixed_logits: (B, T, V) blended teacher logits
-    """
-    progress = step / max(max_steps, 1)
+    # Create student
+    print("\nCreating student model...")
+    student_config = get_model_config(student_preset)
+    student_config.vocab_size = teacher_config.vocab_size
+    student_config.block_size = teacher_config.block_size
 
-    if alpha_schedule == "linear":
-        # Start at 0.3 (mostly small teacher), end at 0.8 (mostly large)
-        w_large = 0.3 + 0.5 * progress
-    elif alpha_schedule == "cosine":
-        w_large = 0.3 + 0.5 * (1 - math.cos(math.pi * progress)) / 2
-    else:
-        w_large = 0.5  # Fixed 50/50
-
-    # Handle vocab size mismatch
-    v_min = min(logits_large.size(-1), logits_small.size(-1))
-    mixed = w_large * logits_large[..., :v_min] + (1 - w_large) * logits_small[..., :v_min]
-
-    # If large teacher has extra vocab, append those logits
-    if logits_large.size(-1) > v_min:
-        mixed = torch.cat([mixed, logits_large[..., v_min:] * w_large], dim=-1)
-
-    return mixed
-
-
-def curriculum_difficulty(data_losses, step, max_steps, warmup_frac=0.2):
-    """Curriculum learning: select easier samples early, harder later.
-
-    Args:
-        data_losses: pre-computed per-sample losses
-        step: current step
-        max_steps: total steps
-        warmup_frac: fraction of training for full curriculum (rest = random)
-
-    Returns:
-        selection_mask: which samples to use
-    """
-    progress = min(step / (max_steps * warmup_frac), 1.0)
-    # Start with easiest 30%, expand to 100%
-    percentile = 0.3 + 0.7 * progress
-    threshold = torch.quantile(data_losses, percentile)
-    return data_losses <= threshold
-
-
-# ==============================================================================
-#  Evaluation
-# ==============================================================================
-
-@torch.no_grad()
-def evaluate(student, teacher, data_loader_fn, block_size, batch_size,
-             device, temperature, alpha, n_iters=50):
-    """Evaluate distillation loss on validation set."""
-    student.eval()
-    losses = []
-    for _ in range(n_iters):
-        X, Y = data_loader_fn("val", block_size, batch_size, device)
-
-        student_logits, _ = student(X)
-        teacher_logits = teacher.get_logits(X)
-
-        loss, _, _ = distillation_loss(
-            student_logits, teacher_logits, Y,
-            temperature=temperature, alpha=alpha,
-        )
-        losses.append(loss.item())
-    student.train()
-    return sum(losses) / len(losses)
-
-
-# ==============================================================================
-#  Main distillation loop
-# ==============================================================================
-
-def distill(args):
-    """Main distillation training loop."""
-
-    # -- Device --
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-    else:
-        device = args.device
-
-    # -- Load teacher --
-    is_hf = args.hf_teacher is not None
-    if is_hf:
-        teacher = HuggingFaceTeacher(args.hf_teacher, device)
-    elif args.teacher:
-        teacher = SuperGPTTeacher(args.teacher, device)
-    else:
-        print("Error: Must provide --teacher (superGPT) or --hf-teacher (HuggingFace)")
-        sys.exit(1)
-
-    # -- Create data loader function --
-    if is_hf:
-        # Use HuggingFace tokenizer for data
-        def load_data(split, block_size, batch_size, dev):
-            return load_data_hf(args.data, split, block_size, batch_size, dev,
-                               teacher.tokenizer)
-    else:
-        def load_data(split, block_size, batch_size, dev):
-            return load_data_bin(args.data, split, block_size, batch_size, dev)
-
-    # -- Create or load student model --
-    if args.student:
-        print(f"Loading student model: {args.student}")
-        student_ckpt = torch.load(args.student, map_location=device, weights_only=False)
-        student_config = GPTConfig(**student_ckpt["model_config"])
-        student = GPT(student_config)
-        student.load_state_dict(student_ckpt["model"])
-    else:
-        print(f"Creating student model: preset={args.student_preset}")
-        student_config = get_model_config(args.student_preset)
-
-        # For HF teacher: match vocab size
-        if is_hf:
-            student_config.vocab_size = teacher.vocab_size
-
-        student = GPT(student_config)
-
+    student = GPT(student_config)
     student.to(device)
-    student.train()
 
     student_params = sum(p.numel() for p in student.parameters())
-    compression = teacher.n_params / student_params
-    print(f"  Student: {student_params/1e6:.1f}M params (trainable)")
-    print(f"  Compression: {compression:.1f}x")
+    print(f"  Student: {student_params/1e6:.1f}M params "
+          f"({teacher_params/student_params:.1f}× compression)")
 
-    block_size = min(teacher.block_size, student_config.block_size)
+    # Load data
+    block_size = teacher_config.block_size
+    train_data = np.memmap(os.path.join(data_dir, "train.bin"),
+                           dtype=np.uint16, mode="r")
+    val_data = np.memmap(os.path.join(data_dir, "val.bin"),
+                         dtype=np.uint16, mode="r")
 
-    # -- Mixed precision --
-    if "cuda" in device and torch.cuda.is_bf16_supported():
-        ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-    elif "cuda" in device:
-        ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
-    else:
-        ctx = nullcontext()
+    def get_batch(split):
+        data = train_data if split == "train" else val_data
+        ix = torch.randint(len(data) - block_size - 1, (batch_size,))
+        x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64))
+                        for i in ix]).to(device)
+        y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64))
+                        for i in ix]).to(device)
+        return x, y
 
-    # -- Optimizer --
-    optimizer = torch.optim.AdamW(
-        student.parameters(), lr=args.lr, weight_decay=0.01,
-        betas=(0.9, 0.95),
-    )
+    # Optimizer
+    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=0.01)
 
-    if args.gradient_checkpointing:
-        student.enable_gradient_checkpointing()
-
-    # -- Training --
-    teacher_name = args.hf_teacher if is_hf else args.teacher
-    print(f"\n{'='*60}")
-    print(f"  Knowledge Distillation")
-    print(f"{'='*60}")
-    print(f"  Teacher:     {teacher_name} ({teacher.n_params/1e6:.1f}M)")
-    print(f"  Student:     {student_params/1e6:.1f}M params ({compression:.1f}x smaller)")
-    print(f"  Temperature: {args.temperature}")
-    print(f"  Alpha:       {args.alpha} (KD={args.alpha:.0%}, CE={1-args.alpha:.0%})")
-    print(f"  LR:          {args.lr}")
-    print(f"  Max iters:   {args.max_iters}")
-    print(f"  Block size:  {block_size}")
-    print(f"  Device:      {device}")
-    if is_hf:
-        print(f"  Mode:        HuggingFace (using teacher's tokenizer)")
-    print(f"{'='*60}\n")
-
+    # Training loop
+    print(f"\nDistilling for {max_iters} iterations...")
     t0 = time.time()
     best_val_loss = float("inf")
-    ema_loss = None
-    ema_kd = None
-    ema_ce = None
 
-    for iter_num in range(args.max_iters):
-        # Cosine LR with warmup
-        if iter_num < args.warmup_iters:
-            lr = args.lr * iter_num / max(1, args.warmup_iters)
-        else:
-            progress = (iter_num - args.warmup_iters) / max(1, args.max_iters - args.warmup_iters)
-            lr = args.lr * 0.5 * (1 + math.cos(math.pi * progress))
+    for iter_num in range(max_iters):
+        student.train()
+        x, y = get_batch("train")
 
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        with torch.no_grad():
+            teacher_logits, _ = teacher(x)
+        student_logits, _ = student(x)
 
-        # -- Evaluate --
-        if iter_num % args.eval_interval == 0:
-            val_loss = evaluate(
-                student, teacher, load_data, block_size,
-                args.batch_size, device, args.temperature, args.alpha,
-            )
-            t1 = time.time()
-            print(f"  Step {iter_num:>5d} | val loss: {val_loss:.4f} | "
-                  f"lr: {lr:.2e} | {t1-t0:.1f}s")
-            t0 = t1
+        loss = distillation_loss(
+            student_logits, teacher_logits, y,
+            temperature=temperature, alpha=alpha,
+        )
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                os.makedirs(args.output_dir, exist_ok=True)
-                ckpt = {
-                    "model": student.state_dict(),
-                    "model_config": student_config.to_dict(),
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                    "distillation": {
-                        "teacher": teacher_name,
-                        "teacher_type": "huggingface" if is_hf else "supergpt",
-                        "temperature": args.temperature,
-                        "alpha": args.alpha,
-                        "compression": compression,
-                    },
-                }
-                save_path = os.path.join(args.output_dir, "distilled_best.pt")
-                torch.save(ckpt, save_path)
-                print(f"    Saved best: {save_path}")
-
-            student.train()
-
-        # -- Train step --
-        X, Y = load_data("train", block_size, args.batch_size, device)
-
-        with ctx:
-            with torch.no_grad():
-                teacher_logits = teacher.get_logits(X)
-
-            student_logits, _ = student(X)
-
-            loss, kd_l, ce_l = distillation_loss(
-                student_logits, teacher_logits, Y,
-                temperature=args.temperature, alpha=args.alpha,
-            )
-
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
 
-        # EMA tracking
-        batch_loss = loss.item()
-        if ema_loss is None:
-            ema_loss = batch_loss
-            ema_kd = kd_l
-            ema_ce = ce_l
-        else:
-            ema_loss = 0.95 * ema_loss + 0.05 * batch_loss
-            ema_kd = 0.95 * ema_kd + 0.05 * kd_l
-            ema_ce = 0.95 * ema_ce + 0.05 * ce_l
+        if iter_num % 100 == 0:
+            t1 = time.time()
+            print(f"  iter {iter_num:>5d} | loss {loss.item():.4f} | {t1-t0:.1f}s")
 
-        if iter_num % 100 == 0 and iter_num > 0:
-            print(f"    iter {iter_num:>5d} | loss {ema_loss:.4f} "
-                  f"(KD={ema_kd:.4f}, CE={ema_ce:.4f}) | lr {lr:.2e}")
+        if iter_num % 500 == 0 and iter_num > 0:
+            student.eval()
+            val_losses = []
+            for _ in range(50):
+                x, y = get_batch("val")
+                with torch.no_grad():
+                    teacher_logits, _ = teacher(x)
+                    student_logits, _ = student(x)
+                    vloss = distillation_loss(
+                        student_logits, teacher_logits, y,
+                        temperature=temperature, alpha=alpha,
+                    )
+                    val_losses.append(vloss.item())
 
-    # -- Final save --
-    os.makedirs(args.output_dir, exist_ok=True)
-    final_path = os.path.join(args.output_dir, "distilled_final.pt")
-    ckpt = {
-        "model": student.state_dict(),
-        "model_config": student_config.to_dict(),
-        "iter_num": args.max_iters,
-        "best_val_loss": best_val_loss,
-        "distillation": {
-            "teacher": teacher_name,
-            "teacher_type": "huggingface" if is_hf else "supergpt",
-            "temperature": args.temperature,
-            "alpha": args.alpha,
-            "compression": compression,
-        },
-    }
-    torch.save(ckpt, final_path)
+            val_loss = sum(val_losses) / len(val_losses)
+            print(f"  [eval] val_loss: {val_loss:.4f}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                os.makedirs("checkpoints", exist_ok=True)
+                torch.save({
+                    "model": student.state_dict(),
+                    "model_config": student_config.to_dict(),
+                    "teacher_config": teacher_config.to_dict(),
+                    "iter_num": iter_num,
+                    "best_val_loss": best_val_loss,
+                }, "checkpoints/distilled.pt")
+                print(f"  ✓ New best! Saved distilled model")
 
     print(f"\n{'='*60}")
-    print(f"  Distillation Complete")
+    print(f"  Distillation complete! Best val loss: {best_val_loss:.4f}")
     print(f"{'='*60}")
-    print(f"  Teacher:         {teacher_name} ({teacher.n_params/1e6:.1f}M)")
-    print(f"  Student:         {student_params/1e6:.1f}M ({compression:.1f}x smaller)")
-    print(f"  Best val loss:   {best_val_loss:.4f}")
-    print(f"  Final checkpoint: {final_path}")
-    print(f"{'='*60}")
-    print(f"\nGenerate with: python generate.py --checkpoint {final_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Knowledge distillation for superGPT",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Distill from Qwen (HuggingFace):
-  python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --student-preset small --data data/
-
-  # Distill from LLaMA:
-  python distill.py --hf-teacher meta-llama/Llama-3.2-1B --student-preset medium
-
-  # Distill from a superGPT checkpoint:
-  python distill.py --teacher checkpoints/large.pt --student-preset small --data data/
-
-  # Custom temperature and alpha:
-  python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --temperature 3.0 --alpha 0.7
-        """,
-    )
-
-    # Teacher (one of these two is required)
-    parser.add_argument("--teacher", type=str, default=None,
-                        help="Path to superGPT teacher checkpoint")
-    parser.add_argument("--hf-teacher", type=str, default=None,
-                        help="HuggingFace model name (e.g. Qwen/Qwen2.5-0.5B, "
-                             "meta-llama/Llama-3.2-1B)")
-
-    # Student
-    parser.add_argument("--student", type=str, default=None,
-                        help="Path to student checkpoint (to resume)")
-    parser.add_argument("--student-preset", type=str, default="small",
-                        help="Preset for new student model (default: small)")
-
-    # Distillation
-    parser.add_argument("--temperature", type=float, default=2.0,
-                        help="Distillation temperature (default: 2.0, higher=softer)")
-    parser.add_argument("--alpha", type=float, default=0.5,
-                        help="KD vs CE balance: 1.0=pure KD, 0.0=pure CE (default: 0.5)")
-
-    # White-Box KD (ICLR 2025 — CKA hidden state matching)
-    parser.add_argument("--hidden-loss", type=str, default="none",
-                        choices=["none", "cka", "mse", "cosine"],
-                        help="Hidden state matching method (default: none)")
-    parser.add_argument("--hidden-weight", type=float, default=0.1,
-                        help="Weight for hidden state loss (default: 0.1)")
-
-    # Mix Distillation (Nov 2025 — multi-teacher + curriculum)
-    parser.add_argument("--hf-teacher-small", type=str, default=None,
-                        help="Second (smaller) HuggingFace teacher for Mix Distillation")
-    parser.add_argument("--curriculum", action="store_true",
-                        help="Enable curriculum learning (easy→hard)")
-    parser.add_argument("--mix-schedule", type=str, default="cosine",
-                        choices=["linear", "cosine", "fixed"],
-                        help="Annealing schedule for multi-teacher blending")
-
-    # Training
-    parser.add_argument("--data", type=str, default="data",
-                        help="Directory with input.txt or train.bin/val.bin")
-    parser.add_argument("--output-dir", type=str, default="checkpoints",
-                        help="Output directory")
-    parser.add_argument("--lr", type=float, default=3e-4,
-                        help="Learning rate (default: 3e-4)")
-    parser.add_argument("--max-iters", type=int, default=5000,
-                        help="Max training iterations (default: 5000)")
-    parser.add_argument("--warmup-iters", type=int, default=200,
-                        help="Warmup iterations (default: 200)")
-    parser.add_argument("--batch-size", type=int, default=32,
-                        help="Batch size (default: 32)")
-    parser.add_argument("--eval-interval", type=int, default=250,
-                        help="Evaluation interval (default: 250)")
-    parser.add_argument("--gradient-checkpointing", action="store_true",
-                        help="Enable gradient checkpointing")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device: auto, cuda, mps, cpu")
-
+    parser = argparse.ArgumentParser(description="Knowledge Distillation")
+    parser.add_argument("--teacher", type=str, required=True)
+    parser.add_argument("--student-preset", type=str, default="small")
+    parser.add_argument("--data-dir", type=str, default="data")
+    parser.add_argument("--max-iters", type=int, default=5000)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--temperature", type=float, default=4.0)
+    parser.add_argument("--alpha", type=float, default=0.7)
+    parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
-
-    if not args.teacher and not args.hf_teacher:
-        print("Error: Must provide --teacher (superGPT) or --hf-teacher (HuggingFace)")
-        print("Examples:")
-        print("  python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --student-preset small")
-        print("  python distill.py --teacher checkpoints/large.pt --student-preset small")
-        sys.exit(1)
-
-    distill(args)
+    distill(**vars(args))

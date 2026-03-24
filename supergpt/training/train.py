@@ -736,6 +736,8 @@ if __name__ == "__main__":
                         help="HuggingFace dataset to stream from (e.g., HuggingFaceFW/fineweb)")
     parser.add_argument("--shard-dir", type=str, default=None,
                         help="Directory containing .bin shard files for streaming")
+    parser.add_argument("--fp8", action="store_true",
+                        help="Enable FP8 mixed-precision training (Hopper+ GPUs)")
 
     args = parser.parse_args()
 
@@ -762,6 +764,23 @@ if __name__ == "__main__":
         use_wandb=args.wandb,
         monitor_backend=monitor_backend,
     )
+
+    # FP8 conversion
+    if args.fp8:
+        try:
+            from supergpt.training.fp8_utils import convert_model_to_fp8, FP8_AVAILABLE
+            if FP8_AVAILABLE:
+                print("\n  FP8 Training: Enabled")
+                # Note: model conversion happens inside train() after model creation
+                train_config.use_fp8 = True
+            else:
+                print("\n  FP8 Training: Not available (requires PyTorch 2.1+ with Hopper GPU)")
+                train_config.use_fp8 = False
+        except ImportError:
+            print("\n  FP8 Training: Import error")
+            train_config.use_fp8 = False
+    else:
+        train_config.use_fp8 = False
 
     # If streaming is requested, monkey-patch load_data with streaming loader
     if args.streaming or args.hf_dataset or args.shard_dir:

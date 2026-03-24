@@ -54,6 +54,8 @@ class GPTConfig:
     aux_loss_free: bool = False  # Use bias-based routing (DeepSeek V3)
     bias_update_speed: float = 0.001  # γ for bias adjustment
     moe_aux_loss_weight: float = 0.01  # Aux loss weight (when not aux_loss_free)
+    n_expert_groups: int = 1     # Number of expert groups for group-limited routing
+    n_limited_groups: int = 1    # Top groups to select from (DeepSeek V3)
 
     # ── Multi-Token Prediction (MTP) — DeepSeek V3 ──────────────────────
     n_predict_tokens: int = 1    # Tokens to predict (1=standard, >1=MTP)
