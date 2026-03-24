@@ -1565,7 +1565,191 @@ python -m supergpt.training.distill \
 
 ---
 
-## 11. Appendix: Open Datasets
+## 15. Phase 14: End-to-End with superGPT
+
+Here's a complete walkthrough of building and training a model from scratch using superGPT.
+
+### Step 1: Prepare Your Data
+
+```bash
+# Option A: Use the built-in data pipeline (FineWeb-Edu, Wikipedia, etc.)
+python -m supergpt.training.data_pipeline \
+    --dataset fineweb-edu \
+    --tokenizer Qwen/Qwen2.5-0.5B \
+    --max-tokens 100000000 \
+    --output-dir data/
+
+# Option B: Use character-level data (for quick tests)
+python -m supergpt.training.data_pipeline \
+    --dataset shakespeare \
+    --output-dir data/
+
+# Option C: Process your own text files
+# Put .txt files in a folder, then:
+python -m supergpt.training.data_pipeline \
+    --input-dir /path/to/your/text/files/ \
+    --tokenizer Qwen/Qwen2.5-0.5B \
+    --output-dir data/
+
+# Option D: Stream from HuggingFace
+python -m supergpt.training.data_pipeline \
+    --dataset HuggingFaceFW/fineweb-edu \
+    --tokenizer Qwen/Qwen2.5-0.5B \
+    --max-tokens 500000000 \
+    --output-dir data/
+```
+
+### Step 2: Choose Your Model Size
+
+```bash
+# See all presets
+python -m supergpt.training.train --help
+
+# Available presets:
+#   micro  - 2.1M params   (testing, CPU ok)
+#   small  - 10.6M params  (1 GPU, fast iteration)
+#   medium - 124M params   (GPT-2 scale, 1 GPU)
+#   large  - 350M params   (multi-GPU recommended)
+#   xl     - 774M params   (4+ GPUs)
+#   xxl    - 1.5B params   (8+ GPUs)
+```
+
+### Step 3: Train
+
+```bash
+# Quick test (5 mins, CPU/single GPU)
+python -m supergpt.training.train \
+    --preset micro \
+    --data-dir data/ \
+    --max-iters 1000 \
+    --device cuda
+
+# Real training (1-2 hours on 1 GPU)
+python -m supergpt.training.train \
+    --preset small \
+    --data-dir data/ \
+    --max-iters 10000 \
+    --batch-size 32 \
+    --lr 3e-4 \
+    --compile \
+    --device cuda
+
+# Production training (multi-GPU)
+torchrun --nproc_per_node=4 \
+    -m supergpt.training.train \
+    --preset medium \
+    --data-dir data/ \
+    --max-iters 50000 \
+    --distributed \
+    --compile
+
+# Resume from checkpoint (automatic)
+python -m supergpt.training.train \
+    --preset small \
+    --data-dir data/ \
+    --max-iters 20000 \
+    --compile --device cuda
+# superGPT auto-detects checkpoints/latest.pt and resumes
+```
+
+### Step 4: Generate Text
+
+```bash
+# Generate from your trained model
+python -m supergpt.inference.generate \
+    --checkpoint checkpoints/best.pt \
+    --prompt "The key principles of machine learning are" \
+    --max-tokens 200 \
+    --temperature 0.8
+
+# Interactive mode
+python -m supergpt.inference.generate \
+    --checkpoint checkpoints/best.pt \
+    --interactive
+```
+
+### Step 5: Fine-Tune with LoRA
+
+```bash
+# LoRA fine-tuning (memory efficient, any GPU)
+python -m supergpt.training.finetune \
+    --checkpoint checkpoints/best.pt \
+    --data-dir data/sft/ \
+    --lora-rank 64 \
+    --max-iters 5000 \
+    --lr 2e-5 \
+    --compile --device cuda
+```
+
+### Step 6: Distill from a Teacher
+
+```bash
+# Knowledge distillation: teacher → student
+python -m supergpt.training.distill \
+    --teacher checkpoints/large_model.pt \
+    --student-preset small \
+    --data-dir data/ \
+    --alpha 0.7 \
+    --temperature 2.0 \
+    --max-iters 10000 \
+    --compile --device cuda
+```
+
+### Step 7: Export & Serve
+
+```bash
+# Export to ONNX for inference
+python -m supergpt.inference.export \
+    --checkpoint checkpoints/best.pt \
+    --format onnx \
+    --output model.onnx
+
+# Serve as an API
+python -m supergpt.inference.serve \
+    --checkpoint checkpoints/best.pt \
+    --port 8000
+# → http://localhost:8000/generate?prompt=Hello&max_tokens=100
+```
+
+### Complete Example: Custom Corpus → Trained Model
+
+```bash
+#!/bin/bash
+# End-to-end: from raw text to trained model
+
+# 1. Prepare your data directory
+mkdir -p my_data/raw
+# Put your .txt, .jsonl, or .md files in my_data/raw/
+
+# 2. Tokenize
+python -m supergpt.training.data_pipeline \
+    --input-dir my_data/raw/ \
+    --tokenizer Qwen/Qwen2.5-0.5B \
+    --output-dir my_data/tokenized/
+
+# 3. Train
+python -m supergpt.training.train \
+    --preset small \
+    --data-dir my_data/tokenized/ \
+    --max-iters 10000 \
+    --batch-size 32 \
+    --lr 3e-4 \
+    --compile \
+    --device cuda
+
+# 4. Test generation
+python -m supergpt.inference.generate \
+    --checkpoint checkpoints/best.pt \
+    --prompt "In this tutorial, we will learn" \
+    --max-tokens 200 \
+    --temperature 0.7
+
+echo "Done! Model saved in checkpoints/"
+```
+
+---
+
+## 16. Appendix: Open Datasets
 
 ### Pre-Training Datasets
 
