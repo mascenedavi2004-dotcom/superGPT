@@ -50,7 +50,10 @@ def load_model(checkpoint_path: str, device: str):
 
     # Create and load model
     model = GPT(config)
-    model.load_state_dict(checkpoint["model"])
+    # Strip _orig_mod. prefix from torch.compile() checkpoints
+    state_dict = checkpoint["model"]
+    unwrapped = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    model.load_state_dict(unwrapped)
     model.to(device)
     model.eval()
 
