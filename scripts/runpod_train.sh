@@ -48,14 +48,13 @@ echo "  Step 1: Downloading & Preparing FineWeb-Edu"
 echo "  Target: 100M tokens with quality filtering + dedup"
 echo "============================================================"
 
-python -m supergpt.training.data_pipeline \
+python -u -m supergpt.training.data_pipeline \
     --dataset HuggingFaceFW/fineweb-edu \
     --subset sample-10BT \
     --tokenizer Qwen/Qwen2.5-0.5B \
     --output-dir data \
     --max-tokens 100000000 \
-    --text-field text \
-    --val-fraction 0.02
+    --shard-size 10000000
 
 echo ""
 echo "Data preparation complete!"
