@@ -539,7 +539,8 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
     if resume_path and os.path.exists(resume_path):
         if is_main_process():
             print(f"Resuming from checkpoint: {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        # Load to CPU first to avoid VRAM OOM during resume
+        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
 
         # Handle FSDP vs non-FSDP checkpoint loading
         raw_model = model.module if hasattr(model, "module") else model
@@ -549,6 +550,13 @@ def train(model_config: GPTConfig, train_config: TrainConfig):
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         if is_main_process():
             print(f"Resumed at iteration {start_iter}, best val loss: {best_val_loss:.4f}")
+            
+        # Immediately free the checkpoint dictionary from memory
+        del checkpoint
+        import gc
+        gc.collect()
+        if "cuda" in device:
+            torch.cuda.empty_cache()
 
     # ── GradScaler for FP16 ───────────────────────────────────────────────
     scaler = torch.amp.GradScaler(
