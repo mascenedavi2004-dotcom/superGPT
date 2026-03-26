@@ -99,35 +99,40 @@ class CheckpointManager:
             self._atomic_save(state, filename, is_best, iter_num)
 
     def _atomic_save(self, state: dict, filename: str, is_best: bool, iter_num: int):
-        """Write to temp file, then atomic rename. Prevents corruption on crash."""
+        """Write to local /tmp first, then copy to target (network-FS safe)."""
         target_path = os.path.join(self.checkpoint_dir, filename)
 
-        # Write to a temp file in the same directory (same filesystem for rename)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=self.checkpoint_dir, suffix=".pt.tmp"
-        )
+        # Write to /tmp (local SSD) to avoid network FS issues with large files
+        fd, tmp_path = tempfile.mkstemp(dir="/tmp", suffix=".pt.tmp")
         try:
             os.close(fd)
             torch.save(state, tmp_path)
-            # Atomic rename
-            shutil.move(tmp_path, target_path)
+            # Remove existing file first (avoids overwrite issues on network FS)
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            shutil.copy2(tmp_path, target_path)
         except Exception as e:
-            # Clean up temp file on error
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
             print(f"  Warning: Checkpoint save failed: {e}")
             return
+        finally:
+            # Always clean up local temp file
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
         # Save periodic numbered checkpoint
         if iter_num > 0 and iter_num % 2000 == 0:
             numbered_path = os.path.join(
                 self.checkpoint_dir, f"step_{iter_num}.pt"
             )
+            if os.path.exists(numbered_path):
+                os.remove(numbered_path)
             shutil.copy2(target_path, numbered_path)
 
         # Save best
         if is_best:
             best_path = os.path.join(self.checkpoint_dir, "best.pt")
+            if os.path.exists(best_path):
+                os.remove(best_path)
             shutil.copy2(target_path, best_path)
 
         # Rotate old checkpoints
